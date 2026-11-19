@@ -25,6 +25,9 @@ crate-type = ["cdylib", "rlib"]
 default = []
 # The PUB + ROUTER publisher thread.
 publisher = ["dep:bytes", "dep:thiserror", "dep:tokio", "dep:tracing", "dep:zeromq"]
+# The consumer side: a gap-free reader of the publisher's stream and the
+# history a relay keeps for resuming consumers.
+relay = ["publisher"]
 # Every PyO3 binding.
 python = ["publisher", "dep:pyo3", "dep:tracing-subscriber"]
 
@@ -48,3 +51,7 @@ serde_json = { workspace = true }
 [[test]]
 name = "publisher"
 required-features = ["publisher"]
+
+[[test]]
+name = "subscriber"
+required-features = ["relay"]

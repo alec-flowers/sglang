@@ -84,6 +84,10 @@ jobs:
       - name: cargo test (workspace)
         run: cargo test --workspace
 
+      # The publisher and relay sit behind features that are off by default.
+      - name: cargo test (sglang-kv-events, all features)
+        run: cargo test -p sglang-kv-events --all-features
+
       # `openai` is off by default; its OpenAI-parity fixtures run offline.
       - name: cargo test (sglang-processor, openai feature)
         run: cargo test -p sglang-processor --features openai
