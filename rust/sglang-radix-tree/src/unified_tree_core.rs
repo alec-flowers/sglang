@@ -4192,15 +4192,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Replace the queued events with the whole tree: an AllBlocksCleared, then
-    /// every resident block, in batches of at most `2 * max_batch_blocks` blocks.
-    /// A consumer that lost events holds the tree again after folding them.
+    /// every resident block, in batches of at most `2 * max_batch_tokens` tokens
+    /// (never less than two blocks). A consumer that lost events holds the tree
+    /// again after folding them.
     pub fn take_resync_events(
         &mut self,
-        max_batch_blocks: usize,
+        max_batch_tokens: usize,
     ) -> Vec<Vec<KvCacheEvent<K::Atom>>> {
         if !self.enable_kv_cache_events {
             return Vec::new();
         }
+        let max_batch_blocks = (max_batch_tokens / self.page_size).max(1);
         // The walk already shows the tree as the queued events leave it.
         self.kv_event_queue.clear();
         let mut batches = vec![vec![KvCacheEvent::AllBlocksCleared]];

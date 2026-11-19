@@ -366,9 +366,10 @@ def _tracker_to_binding(
     return {ids.core(component): freed for component, freed in tracker.items()}
 
 
-# Arbitrary. A resync batch holds up to twice this many blocks, a few hundred
-# KiB encoded, so a whole tree is neither one huge message nor a flood.
-_RESYNC_BATCH_BLOCKS = 8192
+# Arbitrary. A resync batch holds up to twice this many tokens: about 1 MiB
+# encoded at worst (one-token pages, or multimodal pad tokens), so a whole
+# tree is neither one message past a gRPC client's 4 MiB default nor a flood.
+_RESYNC_BATCH_TOKENS = 32768
 
 
 class _RustKVCacheEventRecorder:
@@ -429,7 +430,7 @@ class _RustKVCacheEventRecorder:
         """Replace the queued events with encoded batches that rebuild the whole
         tree: an AllBlocksCleared, then a store of every resident block."""
         return self._binding.take_resync_events_encoded(
-            ts, attn_dp_rank, _RESYNC_BATCH_BLOCKS, *self._label_lookups()
+            ts, attn_dp_rank, _RESYNC_BATCH_TOKENS, *self._label_lookups()
         )
 
 

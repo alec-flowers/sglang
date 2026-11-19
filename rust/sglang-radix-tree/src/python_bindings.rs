@@ -2273,13 +2273,13 @@ macro_rules! tree_core_methods {
                 py: Python<'_>,
                 ts: f64,
                 attn_dp_rank: Option<u32>,
-                max_batch_blocks: usize,
+                max_batch_tokens: usize,
                 lookups: &KvEventLookups<'_, '_>,
             ) -> PyResult<Vec<Py<PyBytes>>>
             where
                 K::Atom: WireTokens,
             {
-                let batches = py.detach(|| self.core().take_resync_events(max_batch_blocks));
+                let batches = py.detach(|| self.core().take_resync_events(max_batch_tokens));
                 self.encode_event_batches(py, batches, ts, attn_dp_rank, lookups)
             }
 
@@ -3654,7 +3654,7 @@ macro_rules! tree_core_binding {
             /// The whole tree as encoded `KVEventBatch`es, replacing the queue;
             /// the lookups are those of `take_events_encoded`.
             #[pyo3(signature = (
-                ts, attn_dp_rank, max_batch_blocks, lora_name=None, mm_label=None, mm_pad_shift=0
+                ts, attn_dp_rank, max_batch_tokens, lora_name=None, mm_label=None, mm_pad_shift=0
             ))]
             #[allow(clippy::too_many_arguments)]
             fn take_resync_events_encoded(
@@ -3662,7 +3662,7 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 ts: f64,
                 attn_dp_rank: Option<u32>,
-                max_batch_blocks: usize,
+                max_batch_tokens: usize,
                 lora_name: Option<&Bound<'_, PyAny>>,
                 mm_label: Option<&Bound<'_, PyAny>>,
                 mm_pad_shift: i64,
@@ -3677,7 +3677,7 @@ macro_rules! tree_core_binding {
                         py,
                         ts,
                         attn_dp_rank,
-                        max_batch_blocks,
+                        max_batch_tokens,
                         &lookups,
                     )
                 })

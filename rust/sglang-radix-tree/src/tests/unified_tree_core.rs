@@ -9659,9 +9659,9 @@ fn run_resident_block_parity(
                     &key, &value, extra_key, cache_salt,
                 ));
                 stream.insert(-1, (None, vec![0], 1));
-                let batches = tc.take_resync_events(/* max_batch_blocks = */ 4);
+                let batches = tc.take_resync_events(/* max_batch_tokens = */ 4);
                 for batch in &batches {
-                    assert!(stored_block_hashes(batch).concat().len() <= 8);
+                    assert!(stored_block_hashes(batch).concat().len() * page_size <= 8);
                     fold_kv_events(&mut stream, batch);
                 }
                 resync_batches += batches.len();
