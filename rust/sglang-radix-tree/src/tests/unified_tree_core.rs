@@ -9491,6 +9491,199 @@ fn random_op_sequence_holds_on_a_paged_swa_core() {
     run_random_op_sequence(tc, 2, /* mamba = */ false);
 }
 
+// What a consumer of the event stream holds: per block hash, its parent, its
+// tokens and a bit per tier.
+type BlockView = HashMap<i64, (Option<i64>, Vec<i64>, u8)>;
+
+fn fold_kv_events(view: &mut BlockView, events: &[KvCacheEvent<i64>]) {
+    for event in events {
+        match event {
+            KvCacheEvent::BlockStored {
+                block_hashes,
+                parent_block_hash,
+                token_ids,
+                block_size,
+                medium,
+                ..
+            } => {
+                let mut parent = *parent_block_hash;
+                for (hash, tokens) in block_hashes.iter().zip(token_ids.chunks(*block_size)) {
+                    let block = view
+                        .entry(*hash)
+                        .or_insert_with(|| (parent, tokens.to_vec(), 0));
+                    assert_eq!((block.0, block.1.as_slice()), (parent, tokens));
+                    block.2 |= 1 << (*medium as u8);
+                    parent = Some(*hash);
+                }
+            }
+            KvCacheEvent::BlockRemoved {
+                block_hashes,
+                medium,
+                ..
+            } => {
+                for hash in block_hashes {
+                    if let Some(block) = view.get_mut(hash) {
+                        block.2 &= !(1 << (*medium as u8));
+                        if block.2 == 0 {
+                            view.remove(hash);
+                        }
+                    }
+                }
+            }
+            KvCacheEvent::AllBlocksCleared => view.clear(),
+        }
+    }
+}
+
+// Fold the events queued since the last call into `stream`; the tree walk
+// must fold to the same view.
+fn assert_walk_matches_stream(tc: &mut UnifiedTreeCore<Vec<i64>>, stream: &mut BlockView) {
+    fold_kv_events(stream, &tc.take_events());
+    let mut walked = BlockView::new();
+    fold_kv_events(&mut walked, &tc.resident_block_events());
+    assert_eq!(&walked, stream);
+    assert!(tc.take_events().is_empty(), "the walk queued events");
+}
+
+fn evict_full_device(tc: &mut UnifiedTreeCore<Vec<i64>>, request_cnt: usize) {
+    let mut tracker = HashMap::from([(FULL, 0)]);
+    let (mut df, mut hf) = (HashMap::new(), HashMap::new());
+    tc.evict_device_start(FULL, request_cnt);
+    loop {
+        let (leaf, step) = tc.evict_device_next_node(FULL, &tracker);
+        accumulate_step(step, &mut tracker, &mut df, &mut hf);
+        let Some(leaf) = leaf else { break };
+        let (_, step) = tc
+            .evict_device_leaf(leaf, /* is_write_back = */ false)
+            .expect("live eviction candidate");
+        accumulate_step(step, &mut tracker, &mut df, &mut hf);
+    }
+    tc.evict_device_end(FULL);
+}
+
+// Random inserts, host backups, demotions, load-backs, evictions of both tiers
+// and resets on a write-through HiCache core, checking the walk after each.
+// `namespaces` are (extra_key, cache_salt) pairs.
+fn run_resident_block_parity(
+    page_size: usize,
+    dynamo_kv_event_format: bool,
+    namespaces: &[(Option<&str>, Option<&str>)],
+) {
+    let mut tc = UnifiedTreeCore::<Vec<i64>>::new(
+        CacheInitParams {
+            page_size,
+            enable_hicache: true,
+            enable_kv_cache_events: true,
+            dynamo_kv_event_format,
+            ..CacheInitParams::default()
+        },
+        vec![FULL],
+    );
+    let mut rng = 0x9E3779B97F4A7C15u64;
+    let mut next_slot = 1000i64;
+    let mut fresh_slots = |len: usize| {
+        let slots: Vec<i64> = (next_slot..next_slot + len as i64).collect();
+        next_slot += len as i64;
+        slots
+    };
+    let mut stream = BlockView::new();
+    let (mut host_stores, mut load_backs, mut host_evictions) = (0, 0, 0);
+    for step in 0..2000 {
+        let depth = page_size * (1 + (xorshift64(&mut rng) % 3) as usize);
+        let key: Vec<i64> = (0..depth)
+            .map(|_| 1 + (xorshift64(&mut rng) % 2) as i64)
+            .collect();
+        let (extra_key, cache_salt) = namespaces[xorshift64(&mut rng) as usize % namespaces.len()];
+        let matched = tc.match_prefix(&match_params_in_namespace(&key, extra_key, cache_salt));
+        match xorshift64(&mut rng) % 10 {
+            0..=2 => {
+                let value = fresh_slots(depth);
+                tc.insert(&insert_params_in_namespace(
+                    &key, &value, extra_key, cache_salt,
+                ));
+            }
+            3 | 4 => {
+                // Unbacked device nodes on the matched path, deepest first.
+                let mut chain = Vec::new();
+                let mut cursor = tc.arena.resolve(matched.last_device_node_id).ok();
+                while let Some(node_idx) = cursor {
+                    let node = tc.arena.node(node_idx);
+                    if node.is_root() || node.backuped() {
+                        break;
+                    }
+                    chain.push((node.id, node.key.atom_len()));
+                    cursor = node.try_parent();
+                }
+                for (node_id, len) in chain.into_iter().rev() {
+                    let host_slots = Tensor::from_slice(&fresh_slots(len));
+                    tc.commit_backup(node_id, host_slots, HashMap::new())
+                        .expect("live matched node");
+                    tc.mark_write_through_pending(vec![node_id], node_id)
+                        .expect("live matched node");
+                    // The copy is on host but its ack has not published it.
+                    assert_walk_matches_stream(&mut tc, &mut stream);
+                    tc.finish_write_through(vec![node_id], node_id)
+                        .expect("live matched node");
+                    host_stores += 1;
+                }
+            }
+            5 | 6 => evict_full_device(&mut tc, /* request_cnt = */ 3),
+            7 | 8 if matched.host_hit_length > 0 => {
+                let anchor = matched.best_match_node_id;
+                let (kv_xfer, comp_xfers) = tc
+                    .build_load_back_spec(anchor, None)
+                    .expect("live matched node");
+                let len = kv_xfer.host_indices.as_ref().map_or(0, Tensor::numel);
+                let device_slots = Tensor::from_slice(&fresh_slots(len));
+                tc.commit_load_back(anchor, device_slots, kv_xfer, comp_xfers)
+                    .expect("live matched node");
+                // The orchestrator holds the loaded path locked until the copy's ack.
+                let lock = tc
+                    .inc_lock_ref(anchor, ComponentSet::EMPTY)
+                    .expect("live matched node");
+                tc.finish_load_back(anchor).expect("live matched node");
+                tc.dec_lock_ref(anchor, &lock.to_dec_params(), /* skip_swa = */ false)
+                    .expect("live matched node");
+                load_backs += 1;
+            }
+            9 if step % 256 < 8 => {
+                tc.reset();
+                tc.record_all_cleared_event();
+            }
+            9 => {
+                let freed = tc.drive_host_eviction(FULL, /* num_tokens = */ 2);
+                host_evictions += usize::from(!freed.host_frees.is_empty());
+            }
+            _ => {}
+        }
+        assert_walk_matches_stream(&mut tc, &mut stream);
+        tc.sanity_check(&[], &[]);
+    }
+    // The sequence must reach both tiers for the comparison to mean anything.
+    assert!(
+        host_stores > 50 && load_backs > 10 && host_evictions > 20,
+        "{host_stores} host stores, {load_backs} load-backs, {host_evictions} host evictions"
+    );
+}
+
+#[test]
+fn resident_block_events_fold_to_what_the_event_stream_built() {
+    run_resident_block_parity(
+        /* page_size = */ 1,
+        /* dynamo_kv_event_format = */ false,
+        &[(None, None), (None, Some("salt"))],
+    );
+}
+
+#[test]
+fn resident_block_events_fold_to_the_stream_across_dynamo_namespaces() {
+    run_resident_block_parity(
+        /* page_size = */ 2,
+        /* dynamo_kv_event_format = */ true,
+        &[(None, None), (Some("adapter"), None), (None, Some("salt"))],
+    );
+}
+
 // Drain every evictable FULL device leaf, as the orchestrator's evict loop does.
 fn drain_full_device(tc: &mut UnifiedTreeCore<Vec<i64>>) {
     let mut tracker = HashMap::from([(FULL, 0)]);

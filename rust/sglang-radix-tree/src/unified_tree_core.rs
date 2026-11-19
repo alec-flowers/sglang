@@ -3952,7 +3952,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Append an event, coalescing it with a compatible queue tail.
     fn enqueue_kv_event_(&mut self, event: KvCacheEvent<K::Atom>) {
-        match (self.kv_event_queue.last_mut(), event) {
+        Self::coalesce_kv_event_(&mut self.kv_event_queue, event);
+    }
+
+    fn coalesce_kv_event_(queue: &mut Vec<KvCacheEvent<K::Atom>>, event: KvCacheEvent<K::Atom>) {
+        match (queue.last_mut(), event) {
             (
                 Some(KvCacheEvent::BlockRemoved {
                     block_hashes: tail_hashes,
@@ -3999,7 +4003,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 tail_hashes.append(&mut block_hashes);
                 tail_token_ids.append(&mut token_ids);
             }
-            (_, event) => self.kv_event_queue.push(event),
+            (_, event) => queue.push(event),
         }
     }
 
@@ -4068,6 +4072,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if !self.enable_kv_cache_events {
             return;
         }
+        for event in self.store_events_(node_id, medium, session_id) {
+            self.enqueue_kv_event_(event);
+        }
+    }
+
+    /// One BlockStored per page of the node; hashes lazily if needed.
+    fn store_events_(
+        &mut self,
+        node_id: NodeIdx_,
+        medium: StorageMedium,
+        session_id: Option<&str>,
+    ) -> Vec<KvCacheEvent<K::Atom>> {
         if self.arena.node(node_id).hash_value.is_none() {
             let hash_values = self.arena.compute_node_hash_values(node_id, self.page_size);
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
@@ -4080,7 +4096,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.ensure_namespaced_event_hashes_(node_id);
         }
         let namespace_seed = self.namespace_seed_(node_id);
-        let events = {
+        {
             let node = self.arena.node(node_id);
             let mut parent_block_hash = node
                 .parent
@@ -4136,10 +4152,32 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 }
             }
             events
-        };
-        for event in events {
-            self.enqueue_kv_event_(event);
         }
+    }
+
+    /// BlockStored events for every block the event stream reports as resident,
+    /// parents first: folding them gives the fold of every event recorded so far.
+    pub fn resident_block_events(&mut self) -> Vec<KvCacheEvent<K::Atom>> {
+        let mut events = Vec::new();
+        let root = self.arena.node(self.arena.root());
+        let mut stack: Vec<NodeIdx_> = root.children.values().copied().collect();
+        while let Some(node_id) = stack.pop() {
+            let node = self.arena.node(node_id);
+            stack.extend(node.children.values().copied());
+            let on_device = node.has_device_value(FULL);
+            // The write-through ack publishes a host copy, not the copy itself.
+            let on_host = node.has_host_value(FULL) && node.write_through_pending_id.is_none();
+            let tiers = [
+                (on_device, StorageMedium::Gpu),
+                (on_host, StorageMedium::Cpu),
+            ];
+            for (_, medium) in tiers.into_iter().filter(|(resident, _)| *resident) {
+                for event in self.store_events_(node_id, medium, /* session_id = */ None) {
+                    Self::coalesce_kv_event_(&mut events, event);
+                }
+            }
+        }
+        events
     }
 
     /// Queue one BlockRemoved carrying all the node's page hashes; hashes lazily if needed.
