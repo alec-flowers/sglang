@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
-use crate::publisher::END_SEQ;
+use crate::publisher::{END_SEQ, RESYNC_REQUEST};
 
 // How long a quiet stream goes unchecked for a lost final batch. Arbitrary;
 // it bounds how stale a snapshot can be after the engine goes idle.
@@ -29,6 +29,9 @@ pub struct SubscriberConfig {
     pub endpoint: String,
     pub replay_endpoint: String,
     pub topic: String,
+    /// After a loss, ask the publisher to publish its whole tree again, at
+    /// most this often. None never asks.
+    pub resync_min_interval: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +181,8 @@ pub async fn run_subscriber(
     probe.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut quiet = true;
     let mut out = Vec::new();
+    let mut resync_wanted = false;
+    let mut last_resync: Option<Instant> = None;
     loop {
         let mut needs_replay = false;
         tokio::select! {
@@ -218,9 +223,22 @@ pub async fn run_subscriber(
             request_replay(&mut replay, &mut sequencer).await?;
         }
         for event in out.drain(..) {
+            resync_wanted |= matches!(event, StreamEvent::Lost { .. });
             if events.send(event).await.is_err() {
                 return Ok(());
             }
+        }
+        // A loss inside the interval waits for it; the probe tick retries.
+        if resync_wanted
+            && let Some(interval) = config.resync_min_interval
+            && last_resync.is_none_or(|at| at.elapsed() >= interval)
+        {
+            let request = vec![Bytes::new(), Bytes::from_static(RESYNC_REQUEST)];
+            let request = ZmqMessage::try_from(request).expect("two frames");
+            let sent = replay.send(request).await;
+            sent.map_err(|e| SubscriberError::Replay(e.to_string()))?;
+            resync_wanted = false;
+            last_resync = Some(Instant::now());
         }
     }
 }

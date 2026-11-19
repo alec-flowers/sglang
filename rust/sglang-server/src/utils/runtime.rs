@@ -328,6 +328,9 @@ const KV_HISTORY_MAX_BATCHES: usize = 10_000;
 const KV_HISTORY_MAX_BYTES: usize = 256 * 1024 * 1024;
 // Arbitrary; a consumer this far behind resumes from its cursor instead.
 const KV_CONSUMER_QUEUE: usize = 4096;
+// Arbitrary. A resync walks the whole tree on the scheduler thread, so a
+// publisher that keeps losing batches must not be asked for one each time.
+const KV_RESYNC_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn start_kv_event_relay(
     source: &crate::message::config::KvEventRelay,
@@ -347,6 +350,7 @@ fn start_kv_event_relay(
             endpoint: source.endpoint.clone(),
             replay_endpoint: source.replay_endpoint.clone(),
             topic: source.topic.clone(),
+            resync_min_interval: source.resync.then_some(KV_RESYNC_MIN_INTERVAL),
         },
         dp_rank: source.dp_rank,
         block_size: source.block_size,
@@ -2263,6 +2267,7 @@ mod tests {
             buffer_steps: 16,
             max_queue_size: 16,
             hwm: 16,
+            accept_resync: false,
         })
         .unwrap();
         let cleared = encode_event_batch(&KvEventBatch {
@@ -2280,6 +2285,7 @@ mod tests {
             "dp_rank": 1,
             "block_size": 16,
             "hash_format": "dynamo",
+            "resync": true,
         });
 
         for relay in [serde_json::Value::Null, relay] {
@@ -2316,6 +2322,7 @@ mod tests {
                     (info.dp_rank, info.block_size, info.hash_format()),
                     (1, 16, kv::KvHashFormat::Dynamo)
                 );
+                assert!(info.reseed_supported);
                 // The batch published before the server started is replayed.
                 let request = kv::SubscribeKvEventsRequest {
                     resume: Some(kv::KvCursor {

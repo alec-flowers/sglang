@@ -401,6 +401,11 @@ class EventPublisher(ABC):
         """Describe a source accessible to a separate local process, if any."""
         return None
 
+    def take_resync_request(self) -> bool:
+        """Whether a consumer that lost batches has asked, since the last call,
+        for the cache's whole tree to be published again."""
+        return False
+
 
 class NullEventPublisher(EventPublisher):
     """No-op implementation (default when disabled)."""
@@ -802,6 +807,7 @@ class RustZmqEventPublisher(EventPublisher):
         max_queue_size: int = 100_000,
         topic: str = "",
         bind: Optional[bool] = None,
+        accept_resync: bool = False,
     ) -> None:
         from sglang.srt.rust_extensions import load_rust_extension
 
@@ -820,6 +826,8 @@ class RustZmqEventPublisher(EventPublisher):
             buffer_steps=buffer_steps,
             max_queue_size=max_queue_size,
             hwm=hwm,
+            # A resync walks the whole tree; only a private socket may ask.
+            accept_resync=accept_resync,
         )
         atexit.register(self.shutdown)
 
@@ -827,6 +835,9 @@ class RustZmqEventPublisher(EventPublisher):
         if events.attn_dp_rank is None:
             events.attn_dp_rank = self._dp_rank
         self.publish_encoded(self._encoder.encode(events))
+
+    def take_resync_request(self) -> bool:
+        return self._publisher.take_resync_request()
 
     def publish_encoded(self, payload: bytes) -> None:
         """Publish a batch a cache recorder has already encoded."""
@@ -901,9 +912,7 @@ class RelayedEventPublisher(EventPublisher):
         bind: Optional[bool] = None,
         compat_zmq: bool = False,
     ) -> None:
-        if compat_zmq and not rust_publisher_can_serve(
-            endpoint, replay_endpoint, bind
-        ):
+        if compat_zmq and not rust_publisher_can_serve(endpoint, replay_endpoint, bind):
             raise ValueError(
                 f"compat_zmq needs endpoints the Rust publisher can bind, not "
                 f"{endpoint!r} and {replay_endpoint!r}"
@@ -924,6 +933,7 @@ class RelayedEventPublisher(EventPublisher):
                 attn_dp_rank=0,
                 endpoint=f"ipc://{self._socket_dir}/pub",
                 replay_endpoint=f"ipc://{self._socket_dir}/replay",
+                accept_resync=True,
                 **queues,
             )
         ]
@@ -948,6 +958,10 @@ class RelayedEventPublisher(EventPublisher):
         # batch, so the two streams carry the same sequence numbers.
         for publisher in self._publishers:
             publisher.publish_encoded(payload)
+
+    def take_resync_request(self) -> bool:
+        """Whether the relay lost batches and asked for the tree again."""
+        return self._publishers[0].take_resync_request()
 
     def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
         """The ZMQ source for outside consumers; the relay's is not one."""

@@ -2139,6 +2139,33 @@ macro_rules! tree_core_methods {
                 for<'py> Vec<K::Atom>: IntoPyObject<'py>,
             {
                 let events = py.detach(|| self.core().take_events());
+                Self::tagged_events(py, events)
+            }
+
+            /// The whole tree as batches of tagged tuples, replacing the queue.
+            fn take_resync_events(
+                &self,
+                py: Python<'_>,
+                max_batch_blocks: usize,
+            ) -> PyResult<Py<PyList>>
+            where
+                for<'py> Vec<K::Atom>: IntoPyObject<'py>,
+            {
+                let batches = py.detach(|| self.core().take_resync_events(max_batch_blocks));
+                let list = PyList::empty(py);
+                for events in batches {
+                    list.append(Self::tagged_events(py, events)?)?;
+                }
+                Ok(list.unbind())
+            }
+
+            fn tagged_events(
+                py: Python<'_>,
+                events: Vec<KvCacheEvent<K::Atom>>,
+            ) -> PyResult<Py<PyList>>
+            where
+                for<'py> Vec<K::Atom>: IntoPyObject<'py>,
+            {
                 let list = PyList::empty(py);
                 for event in events {
                     match event {
@@ -2214,6 +2241,34 @@ macro_rules! tree_core_methods {
                     }))
                 })?;
                 Some(PyBytes::new(py, &payload).unbind())
+            }
+
+            /// The whole tree as encoded `KVEventBatch`es, replacing the queue;
+            /// the same caveat as `take_events_encoded`.
+            fn take_resync_events_encoded(
+                &self,
+                py: Python<'_>,
+                ts: f64,
+                attn_dp_rank: Option<u32>,
+                max_batch_blocks: usize,
+            ) -> Vec<Py<PyBytes>>
+            where
+                K::Atom: WireTokens,
+            {
+                let payloads: Vec<Vec<u8>> = py.detach(|| {
+                    let batches = self.core().take_resync_events(max_batch_blocks);
+                    let encode = |events: Vec<KvCacheEvent<K::Atom>>| {
+                        let events = events.into_iter().map(KvCacheEvent::into_wire).collect();
+                        encode_event_batch(&KvEventBatch {
+                            ts,
+                            events,
+                            attn_dp_rank,
+                        })
+                    };
+                    batches.into_iter().map(encode).collect()
+                });
+                let payloads = payloads.iter();
+                payloads.map(|payload| PyBytes::new(py, payload).unbind()).collect()
             }
 
             /// Drop the subtree rooted at an unbacked D-leaf; not dropped when a lock
@@ -3539,6 +3594,31 @@ macro_rules! tree_core_binding {
                 attn_dp_rank: Option<u32>,
             ) -> PyResult<Option<Py<PyBytes>>> {
                 catch_native_panic(|| Ok(self.inner.take_events_encoded(py, ts, attn_dp_rank)))
+            }
+
+            /// The whole tree as batches of tagged tuples, replacing the queue.
+            fn take_resync_events(
+                &self,
+                py: Python<'_>,
+                max_batch_blocks: usize,
+            ) -> PyResult<Py<PyList>> {
+                catch_native_panic(|| self.inner.take_resync_events(py, max_batch_blocks))
+            }
+
+            /// The whole tree as encoded `KVEventBatch`es, replacing the queue.
+            #[pyo3(signature = (ts, attn_dp_rank, max_batch_blocks))]
+            fn take_resync_events_encoded(
+                &self,
+                py: Python<'_>,
+                ts: f64,
+                attn_dp_rank: Option<u32>,
+                max_batch_blocks: usize,
+            ) -> PyResult<Vec<Py<PyBytes>>> {
+                catch_native_panic(|| {
+                    Ok(self
+                        .inner
+                        .take_resync_events_encoded(py, ts, attn_dp_rank, max_batch_blocks))
+                })
             }
 
             /// Drop the subtree rooted at an unbacked D-leaf; not dropped when a lock

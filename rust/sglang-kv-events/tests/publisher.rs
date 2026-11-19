@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use sglang_kv_events::publisher::{END_SEQ, Publisher, PublisherConfig};
+use sglang_kv_events::publisher::{END_SEQ, Publisher, PublisherConfig, RESYNC_REQUEST};
 use tokio::time::timeout;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
@@ -17,6 +17,7 @@ fn config(endpoint: &str, replay_endpoint: Option<&str>) -> PublisherConfig {
         buffer_steps: 2,
         max_queue_size: 1024,
         hwm: 1024,
+        accept_resync: false,
     }
 }
 
@@ -97,6 +98,38 @@ async fn replay_serves_the_retained_batches_then_the_end_marker() {
     }
     let expected: [&[u8]; 4] = [b"", b"", &END_SEQ, b""];
     assert_eq!(recv(&mut dealer).await, expected);
+}
+
+#[tokio::test]
+async fn resync_request_reaches_only_a_publisher_that_accepts_one() {
+    for accept_resync in [true, false] {
+        let publisher = Publisher::start(PublisherConfig {
+            accept_resync,
+            ..config("tcp://127.0.0.1:0", Some("tcp://127.0.0.1:0"))
+        })
+        .unwrap();
+        let mut dealer = DealerSocket::new();
+        dealer
+            .connect(publisher.local_replay_endpoint().unwrap())
+            .await
+            .unwrap();
+        let resync = vec![Bytes::new(), Bytes::from_static(RESYNC_REQUEST)];
+        dealer
+            .send(ZmqMessage::try_from(resync).unwrap())
+            .await
+            .unwrap();
+        // Requests are handled in order: this reply follows the resync request.
+        let replay = vec![Bytes::new(), Bytes::copy_from_slice(&0u64.to_be_bytes())];
+        dealer
+            .send(ZmqMessage::try_from(replay).unwrap())
+            .await
+            .unwrap();
+        let expected: [&[u8]; 4] = [b"", b"", &END_SEQ, b""];
+        assert_eq!(recv(&mut dealer).await, expected);
+
+        assert_eq!(publisher.take_resync_request(), accept_resync);
+        assert!(!publisher.take_resync_request());
+    }
 }
 
 #[tokio::test]

@@ -34,12 +34,13 @@ pub struct KvStreamInfo {
     /// Blocks currently in the tree, counted once across tiers.
     #[prost(uint64, tag = "7")]
     pub blocks: u64,
-    /// False when the server did not see the stream from its first batch, so a
-    /// snapshot may miss blocks stored before publisher_id began.
+    /// False while the tree may hold blocks the server never saw stored: it lost
+    /// batches, and the engine has not cleared or republished its tree since.
     #[prost(bool, tag = "8")]
     pub complete: bool,
-    /// The server can rebuild a complete view from the engine after losing
-    /// history.
+    /// After losing batches the server asks the engine to republish its tree, as
+    /// an all-cleared event followed by a store of every block; complete is true
+    /// again from that event on.
     #[prost(bool, tag = "9")]
     pub reseed_supported: bool,
 }

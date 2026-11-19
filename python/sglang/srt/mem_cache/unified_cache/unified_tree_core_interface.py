@@ -226,6 +226,15 @@ class UnifiedTreeCoreInterface(ABC):
         """The queued KV placement events as one encoded batch, if any."""
         return self.kv_events.take_encoded(ts=ts, attn_dp_rank=attn_dp_rank)
 
+    def supports_kv_event_resync(self) -> bool:
+        return self.kv_events.supports_resync
+
+    def take_resync_encoded_events(
+        self, *, ts: float, attn_dp_rank: Optional[int]
+    ) -> list[bytes]:
+        """Encoded batches that rebuild the whole tree, replacing the queue."""
+        return self.kv_events.take_resync_encoded(ts=ts, attn_dp_rank=attn_dp_rank)
+
     @abstractmethod
     def reset(self) -> None:
         """Drop the entire tree and reinitialize empty state."""

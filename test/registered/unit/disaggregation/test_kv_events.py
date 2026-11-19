@@ -31,6 +31,7 @@ from sglang.srt.disaggregation.kv_events import (
     RustZmqEventPublisher,
     StorageMedium,
     ZmqEventPublisher,
+    encode_kv_event_batch,
     kv_event_namespace_seed,
     namespaced_block_hash,
     resolve_load_pub_range,
@@ -150,10 +151,27 @@ class _RecorderOnlyCache:
 
     take_events = BasePrefixCache.take_events
     take_encoded_events = BasePrefixCache.take_encoded_events
+    supports_kv_event_resync = BasePrefixCache.supports_kv_event_resync
+    take_resync_encoded_events = BasePrefixCache.take_resync_encoded_events
+
+
+class _TreeRecorder(KVCacheEventRecorder):
+    """A recorder that can republish its tree, as the Rust core's can."""
+
+    supports_resync = True
+
+    def take_resync_encoded(self, *, ts, attn_dp_rank):
+        self.take()
+        return [b"tree-0", b"tree-1"]
+
+
+class _ResyncableCache(_RecorderOnlyCache):
+    def __init__(self):
+        self.kv_events = _TreeRecorder(enabled=True, page_size=1)
 
 
 class TestSchedulerPublishing(CustomTestCase):
-    def _component(self, config, *, rust=False):
+    def _component(self, config, *, rust=False, cache=None):
         parallel = SimpleNamespace(
             pp_rank=0,
             attn_tp_rank=0,
@@ -169,7 +187,7 @@ class TestSchedulerPublishing(CustomTestCase):
         ):
             component = scheduler_publisher.SchedulerKvEventsPublisher(
                 kv_events_config=json.dumps(config),
-                tree_cache=_RecorderOnlyCache(),
+                tree_cache=cache or _RecorderOnlyCache(),
                 send_metrics_from_scheduler=None,
                 max_running_requests=1,
                 max_total_num_tokens=1,
@@ -223,8 +241,12 @@ class TestSchedulerPublishing(CustomTestCase):
         source = relayed.kv_event_relay_source(16)
         self.assertTrue(source.pop("endpoint").startswith("ipc://"))
         self.assertTrue(source.pop("replay_endpoint").startswith("ipc://"))
+        # This cache only records events, so it cannot republish its tree.
         self.assertEqual(
-            source, dict(topic="", dp_rank=2, block_size=16, hash_format="dynamo")
+            source,
+            dict(
+                topic="", dp_rank=2, block_size=16, hash_format="dynamo", resync=False
+            ),
         )
         self.assertEqual(
             relayed.kv_event_streams(16),
@@ -232,6 +254,57 @@ class TestSchedulerPublishing(CustomTestCase):
         )
         # Without compat_zmq no socket is offered to ZMQ consumers.
         self.assertEqual(relayed.local_kv_event_sources(16), [])
+
+    def _stream_after(self, replay_endpoint, request=None):
+        """Send `request`, then return every payload the publisher retains.
+        Requests are handled in order, so the replay shows the state after it."""
+        with zmq.Context.instance().socket(zmq.DEALER) as dealer:
+            dealer.setsockopt(zmq.RCVTIMEO, 5000)
+            dealer.setsockopt(zmq.LINGER, 0)
+            dealer.connect(replay_endpoint)
+            if request is not None:
+                dealer.send_multipart([b"", request])
+            dealer.send_multipart([b"", (0).to_bytes(8, "big")])
+            payloads = []
+            while True:
+                _, _, seq, payload = dealer.recv_multipart()
+                if int.from_bytes(seq, "big", signed=True) == -1:
+                    return payloads
+                payloads.append(payload)
+
+    def test_only_the_relay_can_have_the_tree_published_again(self):
+        # A resync walks the whole tree on the scheduler thread. The relay asks
+        # for one on its private socket after losing batches; a ZMQ consumer of
+        # the compat sockets must not be able to trigger it.
+        component = self._component(
+            {
+                "publisher": "grpc",
+                "format": "dynamo",
+                "compat_zmq": True,
+                "endpoint": f"tcp://*:{get_free_port()}",
+                "replay_endpoint": f"tcp://*:{get_free_port()}",
+            },
+            cache=_ResyncableCache(),
+        )
+        relay = component.kv_event_relay_source(16)
+        self.assertTrue(relay["resync"])
+        compat = component.local_kv_event_sources(16)[0]
+        cleared = encode_kv_event_batch([AllBlocksCleared()], ts=1.5, attn_dp_rank=2)
+
+        with patch.object(scheduler_publisher.time, "time", return_value=1.5):
+            component.tree_cache.kv_events.record_all_cleared()
+            self._stream_after(compat["replay_endpoint"], b"resync")
+            component.publish_kv_events()
+            stream = self._stream_after(relay["replay_endpoint"], b"resync")
+            self.assertEqual(stream, [cleared])
+
+            # The tree replaces the queued event, which it already shows.
+            component.tree_cache.kv_events.record_all_cleared()
+            component.publish_kv_events()
+            component.publish_kv_events()
+        for source in (relay, compat):
+            stream = self._stream_after(source["replay_endpoint"])
+            self.assertEqual(stream, [cleared, b"tree-0", b"tree-1"])
 
 
 class TestGrpcPublisher(CustomTestCase):

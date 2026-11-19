@@ -60,6 +60,9 @@ class SchedulerKvEventsPublisher:
     kv_publisher_dp_rank: int = 0
     # The Rust publisher takes payloads the cache recorder encodes itself.
     publishes_encoded_batches: bool = False
+    # The cache can publish its whole tree again when the publisher's consumer
+    # lost batches and asks for it.
+    resyncs_kv_events: bool = False
     metrics_drop_warned: bool = False
 
     def __post_init__(self) -> None:
@@ -78,6 +81,10 @@ class SchedulerKvEventsPublisher:
             )
             self.publishes_encoded_batches = (
                 self.kv_event_publisher.accepts_encoded_batches
+            )
+            self.resyncs_kv_events = (
+                self.publishes_encoded_batches
+                and self.tree_cache.supports_kv_event_resync()
             )
 
     def emit_kv_metrics(self):
@@ -124,6 +131,7 @@ class SchedulerKvEventsPublisher:
             return None
         source = self.kv_event_publisher.describe_relay_source(block_size)
         source["hash_format"] = KVEventsConfig.from_cli(self.kv_events_config).format
+        source["resync"] = self.resyncs_kv_events
         return source
 
     def kv_event_streams(self, block_size: int) -> list[dict[str, Any]]:
@@ -136,6 +144,20 @@ class SchedulerKvEventsPublisher:
 
     def publish_kv_events(self):
         if not self.enable_kv_cache_events:
+            return
+
+        if self.resyncs_kv_events and self.kv_event_publisher.take_resync_request():
+            # The whole tree replaces the queued events, which it already shows.
+            payloads = self.tree_cache.take_resync_encoded_events(
+                ts=time.time(), attn_dp_rank=self.kv_publisher_dp_rank
+            )
+            logger.warning(
+                "A KV event consumer lost batches; publishing the cache's whole "
+                "tree again in %d batches",
+                len(payloads),
+            )
+            for payload in payloads:
+                self.kv_event_publisher.publish_encoded(payload)
             return
 
         if self.publishes_encoded_batches:

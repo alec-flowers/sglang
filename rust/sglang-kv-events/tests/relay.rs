@@ -18,7 +18,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Channel;
 use tonic::{Code, Streaming};
 
-use common::{WAIT, WithholdingPublisher, churn_payload, payload};
+use common::{WAIT, WithholdingPublisher, churn_payload, payload, tree_payload};
 
 type Client = KvEventServiceClient<Channel>;
 
@@ -30,6 +30,7 @@ fn publisher() -> Publisher {
         buffer_steps: 1024,
         max_queue_size: 1024,
         hwm: 1024,
+        accept_resync: false,
     })
     .unwrap()
 }
@@ -39,6 +40,7 @@ fn source(publisher: &Publisher) -> SubscriberConfig {
         endpoint: publisher.local_pub_endpoint().to_string(),
         replay_endpoint: publisher.local_replay_endpoint().unwrap().to_string(),
         topic: "kv".to_string(),
+        resync_min_interval: None,
     }
 }
 
@@ -263,6 +265,50 @@ async fn lost_history_ends_streams_and_starts_a_new_publisher_id() {
     let stale = subscription(Some((&before.publisher_id, 1)), pb::KvCursorMiss::Fail);
     let status = client.subscribe_kv_events(stale).await.unwrap_err();
     assert_eq!(status.code(), Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn relay_is_complete_again_once_the_engine_republishes_its_tree() {
+    let mut publisher = WithholdingPublisher::bind().await;
+    publisher.ring.push(0);
+    let source = SubscriberConfig {
+        resync_min_interval: Some(Duration::ZERO),
+        ..publisher.config.clone()
+    };
+    let relay = relay(source, 1024, 1024);
+    let mut client = serve(&relay).await;
+    assert_eq!(publisher.serve_replay().await, 0);
+    let before = info_at(&mut client, 1).await;
+    assert!(before.complete && before.reseed_supported);
+
+    // The relay misses 1..5 for good and asks for the tree.
+    publisher.ring = vec![5];
+    publisher.send_live(5).await;
+    while publisher.resyncs == 0 {
+        publisher.serve_replay().await;
+    }
+    let lost = info_at(&mut client, 6).await;
+    assert!(!lost.complete);
+    assert_ne!(lost.publisher_id, before.publisher_id);
+    // A snapshot cut now holds only what arrived since the loss.
+    let request = pb::GetKvSnapshotRequest { max_chunk_bytes: 0 };
+    let mut partial = client.get_kv_snapshot(request).await.unwrap().into_inner();
+    expect_start(&mut partial, pb::KvStreamMode::Snapshot, 6).await;
+    assert_eq!(load_snapshot(&mut partial).await.0.len(), 1);
+
+    publisher.payloads.insert(6, tree_payload(&[40, 41, 42]));
+    publisher.ring.push(6);
+    publisher.send_live(6).await;
+    while publisher.serve_replay().await != 7 {}
+    let after = info_at(&mut client, 7).await;
+    // The tree arrives as events of the stream the loss started.
+    assert_eq!(after.publisher_id, lost.publisher_id);
+    assert_eq!((after.complete, after.blocks), (true, 3));
+    // The partial snapshot is still within the history; it must not be what
+    // a stream that now reports itself complete hands out.
+    let mut whole = client.get_kv_snapshot(request).await.unwrap().into_inner();
+    expect_start(&mut whole, pb::KvStreamMode::Snapshot, 7).await;
+    assert_eq!(load_snapshot(&mut whole).await.0.len(), 3);
 }
 
 #[tokio::test]

@@ -9540,7 +9540,7 @@ fn fold_kv_events(view: &mut BlockView, events: &[KvCacheEvent<i64>]) {
 fn assert_walk_matches_stream(tc: &mut UnifiedTreeCore<Vec<i64>>, stream: &mut BlockView) {
     fold_kv_events(stream, &tc.take_events());
     let mut walked = BlockView::new();
-    fold_kv_events(&mut walked, &tc.resident_block_events());
+    fold_kv_events(&mut walked, &tc.resident_block_events(usize::MAX));
     assert_eq!(&walked, stream);
     assert!(tc.take_events().is_empty(), "the walk queued events");
 }
@@ -9588,6 +9588,7 @@ fn run_resident_block_parity(
     };
     let mut stream = BlockView::new();
     let (mut host_stores, mut load_backs, mut host_evictions) = (0, 0, 0);
+    let mut resync_batches = 0;
     for step in 0..2000 {
         let depth = page_size * (1 + (xorshift64(&mut rng) % 3) as usize);
         let key: Vec<i64> = (0..depth)
@@ -9650,6 +9651,21 @@ fn run_resident_block_parity(
                 tc.reset();
                 tc.record_all_cleared_event();
             }
+            9 if step % 256 < 64 => {
+                // The consumer misses this insert and holds a block the tree
+                // does not; a resync must repair both.
+                let value = fresh_slots(depth);
+                tc.insert(&insert_params_in_namespace(
+                    &key, &value, extra_key, cache_salt,
+                ));
+                stream.insert(-1, (None, vec![0], 1));
+                let batches = tc.take_resync_events(/* max_batch_blocks = */ 4);
+                for batch in &batches {
+                    assert!(stored_block_hashes(batch).concat().len() <= 8);
+                    fold_kv_events(&mut stream, batch);
+                }
+                resync_batches += batches.len();
+            }
             9 => {
                 let freed = tc.drive_host_eviction(FULL, /* num_tokens = */ 2);
                 host_evictions += usize::from(!freed.host_frees.is_empty());
@@ -9661,8 +9677,9 @@ fn run_resident_block_parity(
     }
     // The sequence must reach both tiers for the comparison to mean anything.
     assert!(
-        host_stores > 50 && load_backs > 10 && host_evictions > 20,
-        "{host_stores} host stores, {load_backs} load-backs, {host_evictions} host evictions"
+        host_stores > 50 && load_backs > 10 && host_evictions > 20 && resync_batches > 20,
+        "{host_stores} host stores, {load_backs} load-backs, {host_evictions} host evictions, \
+         {resync_batches} resync batches"
     );
 }
 

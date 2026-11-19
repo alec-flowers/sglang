@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use sglang_kv_events::publisher::{Publisher, PublisherConfig};
 use sglang_kv_events::subscriber::{StreamEvent, SubscriberConfig, run_subscriber};
 use tokio::sync::mpsc;
@@ -18,6 +20,7 @@ fn publisher(buffer_steps: usize) -> Publisher {
         buffer_steps,
         max_queue_size: 4096,
         hwm: 4096,
+        accept_resync: false,
     })
     .unwrap()
 }
@@ -27,6 +30,7 @@ fn subscribe(publisher: &Publisher) -> mpsc::Receiver<StreamEvent> {
         endpoint: publisher.local_pub_endpoint().to_string(),
         replay_endpoint: publisher.local_replay_endpoint().unwrap().to_string(),
         topic: "kv".to_string(),
+        resync_min_interval: None,
     };
     let (tx, rx) = mpsc::channel(4096);
     tokio::spawn(async move { run_subscriber(config, tx).await.unwrap() });
@@ -94,4 +98,38 @@ async fn batches_evicted_from_the_ring_are_reported_lost() {
     };
     assert_eq!(next(&mut events).await, lost);
     expect_batches(&mut events, 8..10).await;
+}
+
+#[tokio::test]
+async fn losses_ask_for_a_resync_at_most_once_per_interval() {
+    let interval = Duration::from_secs(4);
+    let mut publisher = WithholdingPublisher::bind().await;
+    publisher.ring.push(0);
+    let config = SubscriberConfig {
+        resync_min_interval: Some(interval),
+        ..publisher.config.clone()
+    };
+    let (tx, mut events) = mpsc::channel(64);
+    tokio::spawn(run_subscriber(config, tx));
+    assert_eq!(publisher.serve_replay().await, 0);
+    expect_batches(&mut events, 0..1).await;
+
+    // Two holes the ring cannot fill, well inside one interval.
+    let first_loss = Instant::now();
+    for (expected, resumed_at) in [(1, 5), (6, 9)] {
+        publisher.ring = vec![resumed_at];
+        publisher.send_live(resumed_at).await;
+        while publisher.serve_replay().await != expected {}
+        let lost = StreamEvent::Lost {
+            expected,
+            resumed_at,
+        };
+        assert_eq!(next(&mut events).await, lost);
+        expect_batches(&mut events, resumed_at..resumed_at + 1).await;
+    }
+    while publisher.resyncs < 2 {
+        publisher.serve_replay().await;
+    }
+    // The second request waited for the interval instead of following its loss.
+    assert!(first_loss.elapsed() >= interval);
 }

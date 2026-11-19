@@ -4157,7 +4157,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// BlockStored events for every block the event stream reports as resident,
     /// parents first: folding them gives the fold of every event recorded so far.
-    pub fn resident_block_events(&mut self) -> Vec<KvCacheEvent<K::Atom>> {
+    /// An event stops growing once it holds `max_run_blocks` blocks.
+    pub fn resident_block_events(&mut self, max_run_blocks: usize) -> Vec<KvCacheEvent<K::Atom>> {
         let mut events = Vec::new();
         let root = self.arena.node(self.arena.root());
         let mut stack: Vec<NodeIdx_> = root.children.values().copied().collect();
@@ -4165,7 +4166,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let node = self.arena.node(node_id);
             stack.extend(node.children.values().copied());
             let on_device = node.has_device_value(FULL);
-            // The write-through ack publishes a host copy, not the copy itself.
+            // A host copy under a pending write-through is left out, even one an
+            // earlier ack published: the pending ack publishes it (again).
             let on_host = node.has_host_value(FULL) && node.write_through_pending_id.is_none();
             let tiers = [
                 (on_device, StorageMedium::Gpu),
@@ -4173,11 +4175,47 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             ];
             for (_, medium) in tiers.into_iter().filter(|(resident, _)| *resident) {
                 for event in self.store_events_(node_id, medium, /* session_id = */ None) {
-                    Self::coalesce_kv_event_(&mut events, event);
+                    let run_is_full = matches!(
+                        events.last(),
+                        Some(KvCacheEvent::BlockStored { block_hashes, .. })
+                            if block_hashes.len() >= max_run_blocks
+                    );
+                    if run_is_full {
+                        events.push(event);
+                    } else {
+                        Self::coalesce_kv_event_(&mut events, event);
+                    }
                 }
             }
         }
         events
+    }
+
+    /// Replace the queued events with the whole tree: an AllBlocksCleared, then
+    /// every resident block, in batches of at most `2 * max_batch_blocks` blocks.
+    /// A consumer that lost events holds the tree again after folding them.
+    pub fn take_resync_events(
+        &mut self,
+        max_batch_blocks: usize,
+    ) -> Vec<Vec<KvCacheEvent<K::Atom>>> {
+        if !self.enable_kv_cache_events {
+            return Vec::new();
+        }
+        // The walk already shows the tree as the queued events leave it.
+        self.kv_event_queue.clear();
+        let mut batches = vec![vec![KvCacheEvent::AllBlocksCleared]];
+        let mut batch_blocks = 0;
+        for event in self.resident_block_events(max_batch_blocks) {
+            if batch_blocks >= max_batch_blocks {
+                batches.push(Vec::new());
+                batch_blocks = 0;
+            }
+            if let KvCacheEvent::BlockStored { block_hashes, .. } = &event {
+                batch_blocks += block_hashes.len();
+            }
+            batches.last_mut().expect("starts non-empty").push(event);
+        }
+        batches
     }
 
     /// Queue one BlockRemoved carrying all the node's page hashes; hashes lazily if needed.

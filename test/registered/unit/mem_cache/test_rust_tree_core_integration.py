@@ -2469,6 +2469,63 @@ def test_encoded_events_are_the_msgspec_bytes_of_take_events(case):
     assert encoded.take_encoded_events(ts=1.5, attn_dp_rank=3) is None
 
 
+def _blocks_after(payloads) -> dict:
+    """What a consumer holds after folding these encoded batches: per block
+    hash, its parent, tokens, names and the tiers holding it."""
+    blocks = {}
+    for payload in payloads:
+        _, events, _ = msgspec.msgpack.decode(payload)
+        for event in events:
+            medium = event.get("medium", "GPU")
+            if event["type"] == "AllBlocksCleared":
+                blocks.clear()
+            elif event["type"] == "BlockRemoved":
+                for block_hash in event["block_hashes"]:
+                    blocks[block_hash]["tiers"].discard(medium)
+                    if not blocks[block_hash]["tiers"]:
+                        del blocks[block_hash]
+            else:
+                size = event["block_size"]
+                parent = event["parent_block_hash"]
+                for index, block_hash in enumerate(event["block_hashes"]):
+                    block = blocks.setdefault(
+                        block_hash,
+                        dict(
+                            parent=parent,
+                            tokens=event["token_ids"][
+                                index * size : (index + 1) * size
+                            ],
+                            lora_name=event.get("lora_name"),
+                            cache_salt=event.get("cache_salt"),
+                            tiers=set(),
+                        ),
+                    )
+                    block["tiers"].add(medium)
+                    parent = block_hash
+    return blocks
+
+
+# The "text" script records a clear without resetting the tree, so its stream
+# and its tree disagree by construction.
+@pytest.mark.parametrize("case", sorted(set(_ENCODED_EVENT_CASES) - {"text"}))
+def test_resync_batches_rebuild_what_the_event_stream_built(case):
+    """A consumer that lost events folds the resync batches instead, so they
+    must leave it where the stream would have, whichever of the two encoders
+    the recorder is using."""
+    params, script, _ = _ENCODED_EVENT_CASES[case]
+    core = _tree_core(enable_kv_cache_events=True, **params)
+    assert core.supports_kv_event_resync()
+    script(core)
+    stream = _blocks_after([core.take_encoded_events(ts=1.5, attn_dp_rank=3)])
+    assert stream
+    # A queued event is dropped: the walk already shows what it did.
+    core.kv_events.record_all_cleared()
+    payloads = core.take_resync_encoded_events(ts=1.5, attn_dp_rank=3)
+    assert msgspec.msgpack.decode(payloads[0])[1][0] == {"type": "AllBlocksCleared"}
+    assert _blocks_after(payloads) == stream
+    assert core.take_events() == []
+
+
 def test_encoded_events_carry_routing_spans_once_a_label_is_registered(monkeypatch):
     """The binding has no routing labels, so it must stop encoding events
     itself as soon as one exists, or labeled blocks lose their spans."""

@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -19,6 +19,10 @@ use zeromq::{PubSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage
 
 /// The sequence frame of the message that ends a replay: -1 as i64 BE.
 pub const END_SEQ: [u8; 8] = [0xff; 8];
+/// `[identity, "", RESYNC_REQUEST]` on the replay socket asks the engine to
+/// publish its whole tree again. There is no reply: the tree arrives as
+/// ordinary batches.
+pub const RESYNC_REQUEST: &[u8] = b"resync";
 
 // Same grace period as ZmqEventPublisher.SHUTDOWN_TIMEOUT.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -41,6 +45,9 @@ pub struct PublisherConfig {
     pub max_queue_size: usize,
     /// Batches queued for the PUB socket, shared by all subscribers; 0 for no limit.
     pub hwm: usize,
+    /// Whether a resync request on the replay socket is honored. A resync
+    /// walks the whole tree, so only a private socket should accept one.
+    pub accept_resync: bool,
 }
 
 /// 0 means no limit, as for `queue.Queue(maxsize=0)` and ZMQ_SNDHWM.
@@ -94,6 +101,8 @@ struct Counters {
     dropped: AtomicU64,
     /// Batches that found the PUB queue full: they are only in the replay ring.
     live_dropped: AtomicU64,
+    /// A subscriber asked for the whole tree since the last `take_resync_request`.
+    resync_requested: AtomicBool,
 }
 
 pub struct Publisher {
@@ -187,6 +196,13 @@ impl Publisher {
     /// are in the replay ring, where a subscriber that sees the gap finds them.
     pub fn live_dropped_batches(&self) -> u64 {
         self.counters.live_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Whether a subscriber asked for the whole tree since the last call.
+    pub fn take_resync_request(&self) -> bool {
+        self.counters
+            .resync_requested
+            .swap(false, Ordering::Relaxed)
     }
 
     /// The bound PUB endpoint, with the real port for a `:0` bind.
@@ -310,8 +326,11 @@ async fn run(
     let live = tokio::spawn(send_live(pub_socket, live_rx));
     let (request_tx, mut requests) = mpsc::channel(REPLAY_BACKLOG);
     let (replay_tx, replay_rx) = mpsc::channel(REPLAY_BACKLOG);
-    let replay = router
-        .map(|router| tokio::spawn(serve_replays(router, request_tx, replay_rx, topic.clone())));
+    let resync = config.accept_resync.then(|| counters.clone());
+    let replay = router.map(|router| {
+        let topic = topic.clone();
+        tokio::spawn(serve_replays(router, request_tx, replay_rx, topic, resync))
+    });
 
     let mut ring = Ring {
         entries: VecDeque::new(),
@@ -381,6 +400,7 @@ async fn serve_replays(
     requests: mpsc::Sender<ReplayRequest>,
     mut replays: mpsc::Receiver<Replay>,
     topic: Bytes,
+    resync: Option<Arc<Counters>>,
 ) {
     loop {
         tokio::select! {
@@ -389,12 +409,16 @@ async fn serve_replays(
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 };
-                let Some(request) = replay_request(message) else {
-                    tracing::warn!("invalid KV event replay request");
-                    continue;
-                };
-                if requests.send(request).await.is_err() {
-                    return;
+                match (parse_request(message), &resync) {
+                    (Some(Request::Replay(request)), _) => {
+                        if requests.send(request).await.is_err() {
+                            return;
+                        }
+                    }
+                    (Some(Request::Resync), Some(counters)) => {
+                        counters.resync_requested.store(true, Ordering::Relaxed);
+                    }
+                    _ => tracing::warn!("invalid KV event replay request"),
                 }
             }
             Some(replay) = replays.recv() => send_replay(&mut socket, replay, &topic).await,
@@ -402,12 +426,22 @@ async fn serve_replays(
     }
 }
 
-fn replay_request(message: ZmqMessage) -> Option<ReplayRequest> {
+enum Request {
+    Replay(ReplayRequest),
+    Resync,
+}
+
+fn parse_request(message: ZmqMessage) -> Option<Request> {
     match message.into_vec().as_slice() {
-        [identity, delimiter, start_seq] if delimiter.is_empty() => Some(ReplayRequest {
-            identity: identity.clone(),
-            start_seq: u64::from_be_bytes(start_seq.as_ref().try_into().ok()?),
-        }),
+        [_identity, delimiter, body] if delimiter.is_empty() && body.as_ref() == RESYNC_REQUEST => {
+            Some(Request::Resync)
+        }
+        [identity, delimiter, start_seq] if delimiter.is_empty() => {
+            Some(Request::Replay(ReplayRequest {
+                identity: identity.clone(),
+                start_seq: u64::from_be_bytes(start_seq.as_ref().try_into().ok()?),
+            }))
+        }
         _ => None,
     }
 }

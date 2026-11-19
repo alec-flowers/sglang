@@ -856,6 +856,18 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             return None
         return self.kv_events.take_encoded(ts=ts, attn_dp_rank=attn_dp_rank)
 
+    def supports_kv_event_resync(self) -> bool:
+        """Whether take_resync_encoded_events can publish the whole tree again
+        for a consumer that lost events."""
+        return self.kv_events is not None and self.kv_events.supports_resync
+
+    def take_resync_encoded_events(
+        self, *, ts: float, attn_dp_rank: Optional[int]
+    ) -> list[bytes]:
+        """Encoded batches that rebuild the whole tree, replacing the queue:
+        an AllBlocksCleared, then a store of every resident block."""
+        return self.kv_events.take_resync_encoded(ts=ts, attn_dp_rank=attn_dp_rank)
+
     def supports_swa(self) -> bool:
         return False
 

@@ -488,3 +488,14 @@ class KVCacheEventRecorder:
     ) -> Optional[bytes]:
         """Take all events as one encoded batch; None when there are none."""
         return encode_kv_event_batch(self.take(), ts=ts, attn_dp_rank=attn_dp_rank)
+
+    # Whether `take_resync_encoded` can describe the cache's whole tree. This
+    # recorder only sees events, so it cannot.
+    supports_resync = False
+
+    def take_resync_encoded(
+        self, *, ts: float, attn_dp_rank: Optional[int]
+    ) -> list[bytes]:
+        """Replace the queued events with encoded batches that rebuild the whole
+        tree: an AllBlocksCleared, then a store of every resident block."""
+        raise NotImplementedError("this cache cannot republish its tree")

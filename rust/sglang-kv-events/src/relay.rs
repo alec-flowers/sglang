@@ -242,8 +242,11 @@ struct Build {
 struct State {
     config: RelayConfig,
     publisher_id: String,
-    /// False once any batch of this publisher id was not seen.
+    /// False while the engine may hold blocks from batches that were lost.
     complete: bool,
+    /// The first cut at which the mirror was complete again after a loss; a
+    /// snapshot cut earlier misses blocks and is not served once complete.
+    complete_from: u64,
     history: History<Batch>,
     mirror: Mirror,
     consumers: Vec<Consumer>,
@@ -268,6 +271,7 @@ async fn run(config: RelayConfig, mut commands: mpsc::Receiver<Command>) {
         config,
         publisher_id: new_publisher_id(),
         complete: true,
+        complete_from: 0,
         mirror: Mirror::default(),
         consumers: Vec::new(),
         snapshot: None,
@@ -312,6 +316,12 @@ impl State {
         // Fold before fanning out: a snapshot cut now covers what a consumer
         // has been sent.
         self.mirror.fold(&batch);
+        // From a clear on, the mirror holds every block the engine stored.
+        let cleared = |event: &wire::KvCacheEvent| *event == wire::KvCacheEvent::AllBlocksCleared;
+        if !self.complete && batch.events.iter().any(cleared) {
+            self.complete = true;
+            self.complete_from = seq + 1;
+        }
         let batch = Arc::new(convert::batch(seq, batch));
         self.history.push(batch.clone(), payload.len());
         self.consumers.retain(|consumer| {
@@ -345,15 +355,17 @@ impl State {
     /// latest one, one being built, or a new one cut right now.
     fn snapshot_at_cut(&mut self) -> Result<(u64, SnapshotTicket), RelayError> {
         let (waiter, ticket) = oneshot::channel();
+        let complete_from = self.complete_from;
         let history = &self.history;
+        let usable = |cut: u64| history.covers(cut) && cut >= complete_from;
         if let Some(snapshot) = &self.snapshot
-            && history.covers(snapshot.next_seq)
+            && usable(snapshot.next_seq)
         {
             let _ = waiter.send(snapshot.clone());
             return Ok((snapshot.next_seq, ticket));
         }
         let building = self.builds.iter_mut();
-        if let Some(build) = building.rev().find(|build| history.covers(build.next_seq)) {
+        if let Some(build) = building.rev().find(|build| usable(build.next_seq)) {
             build.waiters.push(waiter);
             return Ok((build.next_seq, ticket));
         }
@@ -412,7 +424,7 @@ impl State {
             next_seq: self.history.next_seq(),
             blocks: self.mirror.len() as u64,
             complete: self.complete,
-            reseed_supported: false,
+            reseed_supported: self.config.source.resync_min_interval.is_some(),
         }
     }
 

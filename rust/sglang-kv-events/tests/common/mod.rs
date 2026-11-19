@@ -1,10 +1,11 @@
 //! Shared by the socket-level tests.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::Bytes;
-use sglang_kv_events::publisher::END_SEQ;
+use sglang_kv_events::publisher::{END_SEQ, RESYNC_REQUEST};
 use sglang_kv_events::subscriber::SubscriberConfig;
 use sglang_kv_events::wire::{
     BlockRemoved, BlockStored, KvCacheEvent, KvEventBatch, StorageMedium, TokenIds,
@@ -59,12 +60,24 @@ pub fn churn_payload(seq: u64) -> Bytes {
     encoded(events)
 }
 
+/// An encoded batch that republishes a tree holding one chain of `hashes`.
+pub fn tree_payload(hashes: &[i64]) -> Bytes {
+    encoded(vec![
+        KvCacheEvent::AllBlocksCleared,
+        stored(hashes.to_vec(), None),
+    ])
+}
+
 /// A publisher that only sends live what the test tells it to, and replays
-/// whatever the test has put in its ring. Batch `seq` carries `payload(seq)`.
+/// whatever the test has put in its ring. Batch `seq` carries `payload(seq)`
+/// unless `payloads` names another.
 pub struct WithholdingPublisher {
     live: PubSocket,
     replay: RouterSocket,
     pub ring: Vec<u64>,
+    pub payloads: HashMap<u64, Bytes>,
+    /// Resync requests received so far.
+    pub resyncs: usize,
     pub config: SubscriberConfig,
 }
 
@@ -78,28 +91,45 @@ impl WithholdingPublisher {
             endpoint,
             replay_endpoint,
             topic: "kv".to_string(),
+            resync_min_interval: None,
         };
         Self {
             live,
             replay,
             ring: Vec::new(),
+            payloads: HashMap::new(),
+            resyncs: 0,
             config,
         }
+    }
+
+    fn payload(&self, seq: u64) -> Bytes {
+        self.payloads
+            .get(&seq)
+            .cloned()
+            .unwrap_or_else(|| payload(seq))
     }
 
     pub async fn send_live(&mut self, seq: u64) {
         let frames = vec![
             Bytes::from_static(b"kv"),
             Bytes::copy_from_slice(&seq.to_be_bytes()),
-            payload(seq),
+            self.payload(seq),
         ];
         self.live.send(frames.try_into().unwrap()).await.unwrap();
     }
 
     /// Answer the next replay request from the ring; returns its start.
+    /// Resync requests that arrive before it are counted.
     pub async fn serve_replay(&mut self) -> u64 {
-        let request = timeout(WAIT, self.replay.recv()).await;
-        let request = request.expect("no replay request").unwrap().into_vec();
+        let request = loop {
+            let request = timeout(WAIT, self.replay.recv()).await;
+            let request = request.expect("no replay request").unwrap().into_vec();
+            if request[2].as_ref() != RESYNC_REQUEST {
+                break request;
+            }
+            self.resyncs += 1;
+        };
         let start = u64::from_be_bytes(request[2].as_ref().try_into().unwrap());
         let reply = |topic: &'static [u8], seq: [u8; 8], payload: Bytes| {
             let frames = vec![
@@ -112,7 +142,7 @@ impl WithholdingPublisher {
             ZmqMessage::try_from(frames).unwrap()
         };
         for seq in self.ring.iter().filter(|seq| **seq >= start) {
-            let message = reply(b"kv", seq.to_be_bytes(), payload(*seq));
+            let message = reply(b"kv", seq.to_be_bytes(), self.payload(*seq));
             self.replay.send(message).await.unwrap();
         }
         let end = reply(b"", END_SEQ, Bytes::new());

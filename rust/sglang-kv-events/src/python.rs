@@ -26,7 +26,10 @@ struct PyPublisher {
 #[pymethods]
 impl PyPublisher {
     #[new]
-    #[pyo3(signature = (*, endpoint, replay_endpoint, topic, buffer_steps, max_queue_size, hwm))]
+    #[pyo3(signature = (
+        *, endpoint, replay_endpoint, topic, buffer_steps, max_queue_size, hwm, accept_resync=false
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         endpoint: String,
@@ -35,6 +38,7 @@ impl PyPublisher {
         buffer_steps: usize,
         max_queue_size: usize,
         hwm: usize,
+        accept_resync: bool,
     ) -> PyResult<Self> {
         let config = PublisherConfig {
             endpoint,
@@ -43,6 +47,7 @@ impl PyPublisher {
             buffer_steps,
             max_queue_size,
             hwm,
+            accept_resync,
         };
         let inner = py.detach(|| Publisher::start(config)).map_err(to_py_err)?;
         Ok(Self { inner })
@@ -53,6 +58,11 @@ impl PyPublisher {
         self.inner
             .publish(Bytes::copy_from_slice(payload))
             .map_err(to_py_err)
+    }
+
+    /// Whether a subscriber asked for the whole tree since the last call.
+    fn take_resync_request(&self) -> bool {
+        self.inner.take_resync_request()
     }
 
     #[getter]

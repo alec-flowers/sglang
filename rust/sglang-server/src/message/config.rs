@@ -642,6 +642,8 @@ pub struct KvEventRelay {
     pub block_size: u32,
     /// `KVEventsConfig.format`: "default" or "dynamo".
     pub hash_format: String,
+    /// The publisher's cache can publish its whole tree again on request.
+    pub resync: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

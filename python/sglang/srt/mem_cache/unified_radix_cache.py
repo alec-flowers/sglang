@@ -4978,6 +4978,14 @@ class UnifiedRadixCache(BasePrefixCache):
     def take_encoded_events(self, *, ts: float, attn_dp_rank: Optional[int]):
         return self.tree_core.take_encoded_events(ts=ts, attn_dp_rank=attn_dp_rank)
 
+    def supports_kv_event_resync(self) -> bool:
+        return self.tree_core.supports_kv_event_resync()
+
+    def take_resync_encoded_events(self, *, ts: float, attn_dp_rank: Optional[int]):
+        return self.tree_core.take_resync_encoded_events(
+            ts=ts, attn_dp_rank=attn_dp_rank
+        )
+
     def resolve_node_handle(self, node_handle):
         """Look up the node object from its NodeId.
 

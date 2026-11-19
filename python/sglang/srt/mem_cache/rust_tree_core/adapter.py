@@ -365,6 +365,11 @@ def _tracker_to_binding(
     return {ids.core(component): freed for component, freed in tracker.items()}
 
 
+# Arbitrary. A resync batch holds up to twice this many blocks, a few hundred
+# KiB encoded, so a whole tree is neither one huge message nor a flood.
+_RESYNC_BATCH_BLOCKS = 8192
+
+
 class _RustKVCacheEventRecorder:
     """Expose the Rust event queue through the Python recorder interface."""
 
@@ -407,6 +412,29 @@ class _RustKVCacheEventRecorder:
         if self.encodes_natively():
             return self._binding.take_events_encoded(ts, attn_dp_rank)
         return encode_kv_event_batch(self.take(), ts=ts, attn_dp_rank=attn_dp_rank)
+
+    supports_resync = True
+
+    def take_resync_encoded(
+        self, *, ts: float, attn_dp_rank: Optional[int]
+    ) -> list[bytes]:
+        """Replace the queued events with encoded batches that rebuild the whole
+        tree: an AllBlocksCleared, then a store of every resident block."""
+        if self.encodes_natively():
+            return self._binding.take_resync_events_encoded(
+                ts, attn_dp_rank, _RESYNC_BATCH_BLOCKS
+            )
+        return [
+            encode_kv_event_batch(
+                [
+                    _kv_event_from_tagged(event, self._lora_names, self._dynamo_format)
+                    for event in batch
+                ],
+                ts=ts,
+                attn_dp_rank=attn_dp_rank,
+            )
+            for batch in self._binding.take_resync_events(_RESYNC_BATCH_BLOCKS)
+        ]
 
 
 class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
