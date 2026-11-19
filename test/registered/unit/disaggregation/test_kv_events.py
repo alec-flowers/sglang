@@ -24,12 +24,14 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
     EventPublisherFactory,
     KVEventBatch,
+    RustZmqEventPublisher,
     StorageMedium,
     ZmqEventPublisher,
     kv_event_namespace_seed,
     namespaced_block_hash,
     resolve_load_pub_range,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import describe_kv_events_publisher
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import get_free_port
@@ -51,25 +53,38 @@ KV_EVENT_TYPES = {
 }
 
 
-class TestLocalKvEventSource(CustomTestCase):
-    def _publisher(self, attn_dp_rank=0, **config):
+def create_zmq_publisher(test, *, rust, attn_dp_rank=0, **config):
+    with envs.SGLANG_USE_RUST_KV_EVENT_PUBLISHER.override(rust):
         publisher = EventPublisherFactory.create(
             json.dumps({"publisher": "zmq", **config}), attn_dp_rank=attn_dp_rank
         )
-        atexit.unregister(publisher.shutdown)
-        self.addCleanup(publisher.shutdown)
-        return publisher
+    atexit.unregister(publisher.shutdown)
+    test.addCleanup(publisher.shutdown)
+    return publisher
 
+
+class TestLocalKvEventSource(CustomTestCase):
     def test_advertised_source_delivers_events(self):
-        for host, bind, topic in (("*", None, "kv"), ("127.0.0.1", True, "")):
-            with self.subTest(host=host):
+        cases = (
+            (False, "*", None, "kv"),
+            (False, "127.0.0.1", True, ""),
+            (True, "*", None, "kv"),
+            (True, "127.0.0.1", True, ""),
+        )
+        for rust, host, bind, topic in cases:
+            with self.subTest(rust=rust, host=host):
                 with zmq.Context.instance().socket(zmq.PUB) as probe:
-                    port = probe.bind_to_random_port("tcp://127.0.0.1")
-                publisher = self._publisher(
+                    port = probe.bind_to_random_port("tcp://*")
+                publisher = create_zmq_publisher(
+                    self,
+                    rust=rust,
                     attn_dp_rank=4,
                     endpoint=f"tcp://{host}:{port - 4}",
                     bind=bind,
                     topic=topic,
+                )
+                self.assertIsInstance(
+                    publisher, RustZmqEventPublisher if rust else ZmqEventPublisher
                 )
                 source = publisher.describe_local_source(64)
                 self.assertEqual(
@@ -82,6 +97,23 @@ class TestLocalKvEventSource(CustomTestCase):
                     ),
                 )
                 self._assert_event_received(publisher, source)
+
+    def test_rust_publisher_leaves_unsupported_endpoints_to_python(self):
+        # It only binds, has no inproc transport and does not resolve host
+        # names; selecting it there would turn a working config into a startup
+        # failure or a bind on another address.
+        for config in (
+            dict(endpoint="inproc://kv-fallback-test"),
+            dict(endpoint=f"tcp://127.0.0.1:{get_free_port()}"),
+            dict(endpoint=f"tcp://localhost:{get_free_port()}", bind=True),
+            dict(
+                endpoint=f"tcp://*:{get_free_port()}",
+                replay_endpoint="inproc://kv-fallback-replay",
+            ),
+        ):
+            with self.subTest(config=config):
+                publisher = create_zmq_publisher(self, rust=True, **config)
+                self.assertIsInstance(publisher, ZmqEventPublisher)
 
     def _assert_event_received(self, publisher, source):
         with zmq.Context() as context, context.socket(zmq.SUB) as subscriber:
@@ -235,35 +267,51 @@ class TestReplay(CustomTestCase):
 
     def test_router_serves_buffered_batches_then_end_seq(self):
         # The router's DEALER client relies on this exact framing.
-        replay = f"tcp://127.0.0.1:{get_free_port()}"
-        publisher = ZmqEventPublisher(
-            attn_dp_rank=0,
-            endpoint="inproc://kv-replay-test",
-            replay_endpoint=replay,
-            topic="kv@prefill@model",
-        )
-        dealer = zmq.Context.instance().socket(zmq.DEALER)
-        dealer.setsockopt(zmq.RCVTIMEO, 5000)
-        dealer.connect(replay)
-        try:
-            for _ in range(3):
-                publisher.publish(KVEventBatch(ts=1.0, events=[AllBlocksCleared()]))
-            publisher._event_queue.join()
-            dealer.send_multipart([b"", (1).to_bytes(8, "big")])
-            frames = [dealer.recv_multipart() for _ in range(3)]
-        finally:
-            dealer.close(linger=0)
-            publisher.shutdown()
-        self.assertEqual([len(f) for f in frames], [4, 4, 4])
-        seqs = [int.from_bytes(f[2], "big", signed=True) for f in frames]
-        self.assertEqual(seqs, [1, 2, -1])
-        self.assertEqual([f[0] for f in frames], [b""] * 3)
-        self.assertEqual([f[1] for f in frames], [b"kv@prefill@model"] * 2 + [b""])
-        for frame in frames[:2]:
-            batch = msgspec.msgpack.decode(frame[3], type=KVEventBatch)
-            self.assertEqual(batch.events, [AllBlocksCleared()])
-            self.assertEqual(batch.attn_dp_rank, 0)
-        self.assertEqual(frames[2][3], b"")
+        for rust in (False, True):
+            with self.subTest(rust=rust):
+                replay = f"tcp://127.0.0.1:{get_free_port()}"
+                publisher = create_zmq_publisher(
+                    self,
+                    rust=rust,
+                    # The Rust publisher has no inproc transport.
+                    endpoint=(
+                        f"tcp://127.0.0.1:{get_free_port()}"
+                        if rust
+                        else "inproc://kv-replay-test"
+                    ),
+                    bind=True,
+                    replay_endpoint=replay,
+                    topic="kv@prefill@model",
+                )
+                dealer = zmq.Context.instance().socket(zmq.DEALER)
+                dealer.setsockopt(zmq.RCVTIMEO, 5000)
+                dealer.connect(replay)
+                try:
+                    for _ in range(3):
+                        publisher.publish(
+                            KVEventBatch(ts=1.0, events=[AllBlocksCleared()])
+                        )
+                    if not rust:
+                        # The Rust publisher orders a replay after every
+                        # batch published before the request.
+                        publisher._event_queue.join()
+                    dealer.send_multipart([b"", (1).to_bytes(8, "big")])
+                    frames = [dealer.recv_multipart() for _ in range(3)]
+                finally:
+                    dealer.close(linger=0)
+                    publisher.shutdown()
+                self.assertEqual([len(f) for f in frames], [4, 4, 4])
+                seqs = [int.from_bytes(f[2], "big", signed=True) for f in frames]
+                self.assertEqual(seqs, [1, 2, -1])
+                self.assertEqual([f[0] for f in frames], [b""] * 3)
+                self.assertEqual(
+                    [f[1] for f in frames], [b"kv@prefill@model"] * 2 + [b""]
+                )
+                for frame in frames[:2]:
+                    batch = msgspec.msgpack.decode(frame[3], type=KVEventBatch)
+                    self.assertEqual(batch.events, [AllBlocksCleared()])
+                    self.assertEqual(batch.attn_dp_rank, 0)
+                self.assertEqual(frames[2][3], b"")
 
 
 if __name__ == "__main__":

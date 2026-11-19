@@ -2626,6 +2626,9 @@ class Envs:
     # Build a missing Rust extension from source (auto), require a bundled or
     # cached extension (never), or rebuild the local cache entry (force).
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
+    # Publish KV events from the Rust extension instead of the Python thread;
+    # inproc:// and connect-style endpoints stay on the Python publisher.
+    SGLANG_USE_RUST_KV_EVENT_PUBLISHER = EnvBool(False)
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 

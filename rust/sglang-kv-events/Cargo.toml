@@ -1,17 +1,50 @@
 [package]
 name = "sglang-kv-events"
-description = "KV cache event wire codec for SGLang"
+description = "KV cache event wire codec and publisher for SGLang"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
+# Consumed by python/setup.py: registers this crate as a PyO3 extension module
+# of the main sglang wheel at the given import path.
+[package.metadata.sglang]
+python-module = "sglang.srt.rust_extensions._kv_events"
+debug = false
+features = ["python"]
+
 [lib]
 name = "sglang_kv_events"
+# cdylib: the PyO3 module. rlib: the codec linked by sglang-radix-tree.
+crate-type = ["cdylib", "rlib"]
 
-# The codec has no dependencies on purpose: sglang-radix-tree links it into the
-# libtorch extension, whose dependency set is kept minimal.
+[features]
+# The codec alone has no dependencies on purpose: sglang-radix-tree links it
+# into the libtorch extension, whose dependency set is kept minimal. Nothing
+# is default-on, so a workspace build cannot leak the features below into it.
+default = []
+# The PUB + ROUTER publisher thread.
+publisher = ["dep:bytes", "dep:thiserror", "dep:tokio", "dep:tracing", "dep:zeromq"]
+# Every PyO3 binding.
+python = ["publisher", "dep:pyo3", "dep:tracing-subscriber"]
+
 [dependencies]
+bytes = { workspace = true, optional = true }
+pyo3 = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+# Pure Rust, so the extension needs no C++ toolchain; the same crate
+# sgl-router subscribes with.
+zeromq = { version = "0.6", default-features = false, features = [
+    "tokio-runtime",
+    "all-transport",
+], optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+
+[[test]]
+name = "publisher"
+required-features = ["publisher"]

@@ -20,6 +20,7 @@ KV caching events
 import atexit
 import enum
 import hashlib
+import ipaddress
 import logging
 import os
 import queue
@@ -35,6 +36,7 @@ import msgspec
 import zmq
 from pydantic import BaseModel
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress
 
@@ -390,6 +392,51 @@ class NullEventPublisher(EventPublisher):
         return
 
 
+def describe_local_kv_event_source(
+    *,
+    dp_rank: int,
+    pub_endpoint: Optional[str],
+    replay_endpoint: Optional[str],
+    topic: str,
+    block_size: int,
+) -> Optional[dict[str, Any]]:
+    """Report the bound socket, not a port reconstructed from global DP size.
+
+    Connect-style publishers and inproc sockets have no subscribable local
+    endpoint. They keep working as before, but are not advertised to external
+    processes. Wildcard binds are reachable on loopback from this node.
+    """
+
+    def local_endpoint(endpoint: Optional[str]) -> Optional[str]:
+        if endpoint is None:
+            return None
+        if endpoint.startswith("ipc://"):
+            return endpoint
+        if parse_advertisable_tcp(endpoint) is None:
+            return None
+        address = NetworkAddress.parse(endpoint[len("tcp://") :])
+        host = address.host
+        if host in ("*", "0.0.0.0"):
+            host = "127.0.0.1"
+        elif host == "::":
+            host = "::1"
+        return NetworkAddress(host, address.port).to_tcp()
+
+    endpoint = local_endpoint(pub_endpoint)
+    if endpoint is None:
+        return None
+    source = {
+        "dp_rank": dp_rank,
+        "endpoint": endpoint,
+        "topic": topic,
+        "block_size": block_size,
+    }
+    replay_endpoint = local_endpoint(replay_endpoint)
+    if replay_endpoint is not None:
+        source["replay_endpoint"] = replay_endpoint
+    return source
+
+
 class ZmqEventPublisher(EventPublisher):
     """Reliable PUB/ROUTER publisher with an in-memory replay buffer.
 
@@ -473,41 +520,13 @@ class ZmqEventPublisher(EventPublisher):
         self._event_queue.put(events)
 
     def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
-        """Report the bound socket, not a port reconstructed from global DP size.
-
-        Connect-style publishers and inproc sockets have no subscribable local
-        endpoint. They keep working as before, but are not advertised to external
-        processes. Wildcard binds are reachable on loopback from this node.
-        """
-
-        def local_endpoint(endpoint: Optional[str]) -> Optional[str]:
-            if endpoint is None:
-                return None
-            if endpoint.startswith("ipc://"):
-                return endpoint
-            if parse_advertisable_tcp(endpoint) is None:
-                return None
-            address = NetworkAddress.parse(endpoint[len("tcp://") :])
-            host = address.host
-            if host in ("*", "0.0.0.0"):
-                host = "127.0.0.1"
-            elif host == "::":
-                host = "::1"
-            return NetworkAddress(host, address.port).to_tcp()
-
-        endpoint = local_endpoint(self._local_pub_endpoint)
-        if endpoint is None:
-            return None
-        source = {
-            "dp_rank": self._dp_rank,
-            "endpoint": endpoint,
-            "topic": self._topic_bytes.decode("utf-8"),
-            "block_size": block_size,
-        }
-        replay_endpoint = local_endpoint(self._local_replay_endpoint)
-        if replay_endpoint is not None:
-            source["replay_endpoint"] = replay_endpoint
-        return source
+        return describe_local_kv_event_source(
+            dp_rank=self._dp_rank,
+            pub_endpoint=self._local_pub_endpoint,
+            replay_endpoint=self._local_replay_endpoint,
+            topic=self._topic_bytes.decode("utf-8"),
+            block_size=block_size,
+        )
 
     def shutdown(self) -> None:
         """Stop the publisher thread and clean up resources."""
@@ -689,6 +708,130 @@ class ZmqEventPublisher(EventPublisher):
         raise ValueError("Invalid endpoint: must contain 'inproc', 'ipc' or 'tcp'")
 
 
+def _rust_publisher_can_bind(endpoint: Optional[str]) -> bool:
+    """Whether the Rust publisher binds this address as pyzmq would. It has no
+    inproc or abstract-namespace ipc transport, and it takes a tcp host as
+    written instead of resolving a name."""
+    if endpoint is None:
+        return True
+    if endpoint.startswith("ipc://"):
+        return not endpoint.startswith("ipc://@")
+    if not endpoint.startswith("tcp://"):
+        return False
+    try:
+        host = NetworkAddress.parse(endpoint[len("tcp://") :]).host
+    except ValueError:
+        return False
+    if host in _BIND_WILDCARD_HOSTS:
+        return True
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def _rust_publisher_can_serve(
+    endpoint: str, replay_endpoint: Optional[str], bind: Optional[bool]
+) -> bool:
+    """Whether RustZmqEventPublisher can stand in for ZmqEventPublisher, which
+    it can only where it binds both sockets."""
+    if not (
+        _rust_publisher_can_bind(endpoint) and _rust_publisher_can_bind(replay_endpoint)
+    ):
+        return False
+    if bind is not None:
+        return bind
+    # Same heuristic as ZmqEventPublisher._socket_setup.
+    return (
+        "*" in endpoint
+        or "::" in endpoint
+        or "0.0.0.0" in endpoint
+        or endpoint.startswith("ipc://")
+    )
+
+
+def _absolute_ipc_endpoint(endpoint: Optional[str]) -> Optional[str]:
+    # A separate process resolves the advertised path from its own directory.
+    if endpoint is None or not endpoint.startswith("ipc://"):
+        return endpoint
+    return f"ipc://{os.path.abspath(endpoint[len('ipc://') :])}"
+
+
+class RustZmqEventPublisher(EventPublisher):
+    """ZmqEventPublisher with the queue, sockets and replay ring in Rust.
+
+    The wire format and replay protocol are the same. A batch is given its
+    sequence number on the calling thread, and one that finds the queue full is
+    dropped instead of blocking the caller, which leaves a sequence gap.
+
+    ``hwm`` bounds one queue shared by all subscribers. A subscriber that stops
+    reading for a second is disconnected together with the others; they
+    reconnect and repair the gap through replay.
+    """
+
+    def __init__(
+        self,
+        attn_dp_rank: int,
+        endpoint: str = "tcp://*:5557",
+        replay_endpoint: Optional[str] = None,
+        buffer_steps: int = 10_000,
+        hwm: int = 100_000,
+        max_queue_size: int = 100_000,
+        topic: str = "",
+        bind: Optional[bool] = None,
+    ) -> None:
+        from sglang.srt.rust_extensions import load_rust_extension
+
+        native = load_rust_extension("sglang.srt.rust_extensions._kv_events")
+        self._dp_rank = attn_dp_rank
+        self._topic = topic
+        self._encoder = msgspec.msgpack.Encoder()
+        self._next_drop_warning = 1
+        offset = ZmqEventPublisher.offset_endpoint_port
+        self._publisher = native.Publisher(
+            endpoint=_absolute_ipc_endpoint(offset(endpoint, attn_dp_rank)),
+            replay_endpoint=_absolute_ipc_endpoint(
+                offset(replay_endpoint, attn_dp_rank)
+            ),
+            topic=topic,
+            buffer_steps=buffer_steps,
+            max_queue_size=max_queue_size,
+            hwm=hwm,
+        )
+        atexit.register(self.shutdown)
+
+    def publish(self, events: EventBatch) -> None:
+        if events.attn_dp_rank is None:
+            events.attn_dp_rank = self._dp_rank
+        self.publish_encoded(self._encoder.encode(events))
+
+    def publish_encoded(self, payload: bytes) -> None:
+        """Publish an already encoded batch."""
+        self._publisher.publish(payload)
+        dropped = self._publisher.dropped_batches
+        # Warn at 1, 2, 4, ... drops, so a sustained overflow does not flood the log.
+        if dropped >= self._next_drop_warning:
+            self._next_drop_warning = 2 * dropped
+            logger.warning(
+                "KV event publisher queue is full: %d batches dropped so far; "
+                "subscribers see sequence gaps that replay cannot fill",
+                dropped,
+            )
+
+    def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
+        return describe_local_kv_event_source(
+            dp_rank=self._dp_rank,
+            pub_endpoint=self._publisher.local_pub_endpoint,
+            replay_endpoint=self._publisher.local_replay_endpoint,
+            topic=self._topic,
+            block_size=block_size,
+        )
+
+    def shutdown(self) -> None:
+        self._publisher.shutdown()
+
+
 class KVEventsConfig(BaseModel):
     """Configuration for KV event publishing."""
 
@@ -774,4 +917,16 @@ class EventPublisherFactory:
             constructor = cls._registry[kind]
         except KeyError as exc:
             raise ValueError(f"Unknown event publisher '{kind}'") from exc
+        if kind == "zmq" and envs.SGLANG_USE_RUST_KV_EVENT_PUBLISHER.get():
+            if _rust_publisher_can_serve(
+                config_dict["endpoint"],
+                config_dict["replay_endpoint"],
+                config_dict["bind"],
+            ):
+                constructor = RustZmqEventPublisher
+            else:
+                logger.warning(
+                    "The Rust KV event publisher cannot serve %s; using the Python one",
+                    config_dict["endpoint"],
+                )
         return constructor(attn_dp_rank=attn_dp_rank, **config_dict)
