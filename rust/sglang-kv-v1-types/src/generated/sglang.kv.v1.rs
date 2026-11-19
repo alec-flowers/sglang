@@ -52,7 +52,9 @@ pub struct SubscribeKvEventsRequest {
     pub resume: ::core::option::Option<KvCursor>,
     #[prost(enumeration = "KvCursorMiss", tag = "2")]
     pub on_miss: i32,
-    /// Upper bound on one snapshot chunk; 0 selects the server default.
+    /// Upper bound on the encoded size of one snapshot chunk item; 0 selects the
+    /// server default. A single stored run (at most 1024 blocks) is never split,
+    /// so a bound smaller than one run is exceeded by that run alone.
     #[prost(uint32, tag = "3")]
     pub max_chunk_bytes: u32,
 }

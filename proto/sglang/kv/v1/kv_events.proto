@@ -115,7 +115,9 @@ message SubscribeKvEventsRequest {
   // KV_CURSOR_MISS_FAIL is INVALID_ARGUMENT.
   optional KvCursor resume = 1;
   KvCursorMiss on_miss = 2;
-  // Upper bound on one snapshot chunk; 0 selects the server default.
+  // Upper bound on the encoded size of one snapshot chunk item; 0 selects the
+  // server default. A single stored run (at most 1024 blocks) is never split,
+  // so a bound smaller than one run is exceeded by that run alone.
   uint32 max_chunk_bytes = 3;
 }
 

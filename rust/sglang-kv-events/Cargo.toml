@@ -30,6 +30,7 @@ publisher = ["dep:bytes", "dep:thiserror", "dep:tokio", "dep:tracing", "dep:zero
 relay = [
     "publisher",
     "dep:async-stream",
+    "dep:prost",
     "dep:sglang-kv-v1-types",
     "dep:tokio-stream",
     "dep:tonic",
@@ -41,6 +42,7 @@ python = ["publisher", "dep:pyo3", "dep:tracing-subscriber"]
 [dependencies]
 async-stream = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 sglang-kv-v1-types = { path = "../sglang-kv-v1-types", optional = true }
 thiserror = { workspace = true, optional = true }

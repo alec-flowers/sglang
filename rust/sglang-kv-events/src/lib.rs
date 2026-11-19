@@ -5,6 +5,8 @@
 pub mod convert;
 #[cfg(feature = "relay")]
 pub mod history;
+#[cfg(feature = "relay")]
+pub mod mirror;
 #[cfg(feature = "publisher")]
 pub mod publisher;
 #[cfg(feature = "python")]

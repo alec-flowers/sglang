@@ -4,12 +4,24 @@ use sglang_kv_v1_types as pb;
 
 use crate::wire;
 
-pub fn tier(medium: wire::StorageMedium) -> pb::KvTier {
+/// An event without a medium is about device memory, the recorder's default.
+pub fn tier(medium: Option<wire::StorageMedium>) -> pb::KvTier {
     match medium {
-        wire::StorageMedium::Gpu => pb::KvTier::Device,
-        wire::StorageMedium::CpuPinned => pb::KvTier::Host,
-        wire::StorageMedium::Disk => pb::KvTier::Disk,
-        wire::StorageMedium::External => pb::KvTier::External,
+        None | Some(wire::StorageMedium::Gpu) => pb::KvTier::Device,
+        Some(wire::StorageMedium::CpuPinned) => pb::KvTier::Host,
+        Some(wire::StorageMedium::Disk) => pb::KvTier::Disk,
+        Some(wire::StorageMedium::External) => pb::KvTier::External,
+    }
+}
+
+pub fn mm_spans(spans: &[wire::MmRoutingSpan]) -> pb::KvMmSpans {
+    let span = |span: &wire::MmRoutingSpan| pb::KvMmSpan {
+        start: span.start,
+        length: span.length,
+        label: span.label.to_string(),
+    };
+    pb::KvMmSpans {
+        spans: spans.iter().map(span).collect(),
     }
 }
 
@@ -27,7 +39,7 @@ fn event(event: wire::KvCacheEvent) -> pb::KvCacheEvent {
         wire::KvCacheEvent::BlockStored(stored) => Event::Stored(blocks_stored(stored)),
         wire::KvCacheEvent::BlockRemoved(removed) => Event::Removed(pb::KvBlocksRemoved {
             block_hashes: removed.block_hashes,
-            tier: removed.medium.map(tier).unwrap_or_default() as i32,
+            tier: tier(removed.medium) as i32,
         }),
         wire::KvCacheEvent::AllBlocksCleared => Event::Cleared(pb::KvAllBlocksCleared {}),
     };
@@ -39,31 +51,17 @@ fn blocks_stored(stored: wire::BlockStored) -> pb::KvBlocksStored {
         wire::TokenIds::Unigram(tokens) => (tokens, false),
         wire::TokenIds::Bigram(pairs) => (flatten(&pairs), true),
     };
-    let spans = |block: Vec<wire::MmRoutingSpan>| pb::KvMmSpans {
-        spans: block
-            .into_iter()
-            .map(|span| pb::KvMmSpan {
-                start: span.start,
-                length: span.length,
-                label: span.label.to_string(),
-            })
-            .collect(),
-    };
+    let spans = stored.mm_routing_spans.unwrap_or_default();
     pb::KvBlocksStored {
         block_hashes: stored.block_hashes,
         parent_block_hash: stored.parent_block_hash,
         token_ids,
         block_size: stored.block_size,
-        tiers: stored.medium.map(|m| tier(m) as i32).into_iter().collect(),
+        tiers: vec![tier(stored.medium) as i32],
         cache_salt: stored.cache_salt.map(|salt| salt.to_string()),
         lora_name: stored.lora_name.map(|name| name.to_string()),
         session_id: stored.session_id.map(|id| id.to_string()),
-        mm_routing_spans: stored
-            .mm_routing_spans
-            .unwrap_or_default()
-            .into_iter()
-            .map(spans)
-            .collect(),
+        mm_routing_spans: spans.iter().map(|block| mm_spans(block)).collect(),
         bigram,
     }
 }
