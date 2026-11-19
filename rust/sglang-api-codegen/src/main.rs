@@ -6,6 +6,8 @@
 //!   `python/sglang/api/v1/api_types.py`.
 //! - `sglang.runtime.v1` (deprecated): prost structs and tonic services only, in
 //!   `rust/sglang-runtime-v1-types/src/generated/`.
+//! - `sglang.kv.v1`: prost structs and tonic services only, in
+//!   `rust/sglang-kv-v1-types/src/generated/`.
 //!
 //! Pass 1 (prost-build + tonic-prost-build) emits the prost structs and tonic
 //! service code, plus a `FileDescriptorSet`. For targets with a JSON contract
@@ -66,6 +68,16 @@ const TARGETS: &[Target] = &[
         rust_out: "rust/sglang-runtime-v1-types/src/generated",
         python_out: None,
         boxed: &[],
+        default_stubs: true,
+    },
+    Target {
+        root: "sglang/kv/v1/kv_events.proto",
+        package: "sglang.kv.v1",
+        rust_out: "rust/sglang-kv-v1-types/src/generated",
+        // gRPC only: the JSON pass has no enum or oneof-of-messages support.
+        python_out: None,
+        boxed: &[],
+        // A server may mount the stream before it can serve snapshots.
         default_stubs: true,
     },
 ];

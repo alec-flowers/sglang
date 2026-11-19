@@ -6,6 +6,7 @@ members = [
     "sglang-bench",
     "sglang-grpc",
     "sglang-kv-events",
+    "sglang-kv-v1-types",
     "sglang-mm",
     "sglang-processor",
     "sglang-runtime-v1-types",

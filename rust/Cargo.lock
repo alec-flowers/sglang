@@ -4131,6 +4131,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sglang-kv-v1-types"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "sglang-mm"
 version = "0.1.0"
 dependencies = [

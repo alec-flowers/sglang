@@ -1,0 +1,228 @@
+// KV cache placement events of one SGLang scheduler, served by the tonic
+// transport of rust/sglang-server next to sglang.api.v1.
+//
+// Each data-parallel rank has its own listener and its own stream. A stream
+// is a sequence of batches numbered densely from 0 by the engine. A consumer
+// keeps a cursor (publisher_id, next_seq) and can always get back to the live
+// state: by resuming from the cursor while the server still holds the batches
+// it missed, or by loading a snapshot of the whole tree and following from
+// the snapshot's cut.
+
+syntax = "proto3";
+
+package sglang.kv.v1;
+
+service KvEventService {
+  // The stream's identity, its history window and the tree size.
+  rpc GetKvStreamInfo(GetKvStreamInfoRequest) returns (KvStreamInfo);
+
+  // Follow the stream. The first item is `start`. With a cursor inside the
+  // history window the missed batches follow, then live batches. Without a
+  // cursor, or with one the server cannot resume from, `on_miss` decides: by
+  // default a snapshot (`snapshot` chunks, then `snapshot_end`) precedes the
+  // live batches. Batches arrive in order with no gaps or repeats.
+  //
+  // Ends with DATA_LOSS when the engine's history is lost and publisher_id
+  // changes, ABORTED when the consumer falls too far behind, and UNAVAILABLE
+  // while the server is starting, recovering or draining. After any of them,
+  // subscribe again with the last cursor.
+  rpc SubscribeKvEvents(SubscribeKvEventsRequest) returns (stream KvStreamItem);
+
+  // The retained batches [from.next_seq, end_seq), then the stream ends.
+  // OUT_OF_RANGE when the window no longer covers `from`, FAILED_PRECONDITION
+  // when `from.publisher_id` is not the current one.
+  rpc GetKvEvents(GetKvEventsRequest) returns (stream KvStreamItem);
+
+  // The whole tree at one cut: `start`, `snapshot` chunks, `snapshot_end`.
+  rpc GetKvSnapshot(GetKvSnapshotRequest) returns (stream KvStreamItem);
+}
+
+// How block hashes are derived; fixed for the life of a stream.
+enum KvHashFormat {
+  KV_HASH_FORMAT_UNSPECIFIED = 0;
+  // Token-only hashes; a named LoRA adapter namespaces its blocks.
+  KV_HASH_FORMAT_DEFAULT = 1;
+  // Hashes namespaced by the request's extra key and cache salt.
+  KV_HASH_FORMAT_DYNAMO = 2;
+}
+
+enum KvTier {
+  KV_TIER_UNSPECIFIED = 0;
+  // Device memory.
+  KV_TIER_DEVICE = 1;
+  // Host pinned memory.
+  KV_TIER_HOST = 2;
+  // Local SSD or NVMe.
+  KV_TIER_DISK = 3;
+  // A shared or remote pool.
+  KV_TIER_EXTERNAL = 4;
+}
+
+enum KvStreamMode {
+  KV_STREAM_MODE_UNSPECIFIED = 0;
+  // Retained batches from the cursor on; nothing was missed.
+  KV_STREAM_MODE_EVENTS = 1;
+  // A snapshot of the tree, to be applied to an empty index.
+  KV_STREAM_MODE_SNAPSHOT = 2;
+  // Live batches only; the state before `next_seq` is not sent.
+  KV_STREAM_MODE_LIVE_ONLY = 3;
+}
+
+// What SubscribeKvEvents does when it cannot resume from the cursor.
+enum KvCursorMiss {
+  KV_CURSOR_MISS_SNAPSHOT = 0;
+  // End the RPC with OUT_OF_RANGE or FAILED_PRECONDITION.
+  KV_CURSOR_MISS_FAIL = 1;
+  KV_CURSOR_MISS_LIVE_ONLY = 2;
+}
+
+// A consumer's position in one stream.
+message KvCursor {
+  // The stream the position belongs to; see KvStreamInfo.publisher_id.
+  string publisher_id = 1;
+  // The sequence number of the first batch the consumer has not applied.
+  uint64 next_seq = 2;
+}
+
+message GetKvStreamInfoRequest {}
+
+message KvStreamInfo {
+  // Identifies one unbroken run of the stream. It changes when the engine
+  // restarts and when history is lost; a cursor from another publisher_id
+  // cannot be resumed.
+  string publisher_id = 1;
+  uint32 dp_rank = 2;
+  // Tokens per block.
+  uint32 block_size = 3;
+  KvHashFormat hash_format = 4;
+  // The retained batches are [oldest_seq, next_seq).
+  uint64 oldest_seq = 5;
+  // The sequence number the next batch will get.
+  uint64 next_seq = 6;
+  // Blocks currently in the tree, counted once across tiers.
+  uint64 blocks = 7;
+  // False when the server did not see the stream from its first batch, so a
+  // snapshot may miss blocks stored before publisher_id began.
+  bool complete = 8;
+  // The server can rebuild a complete view from the engine after losing
+  // history.
+  bool reseed_supported = 9;
+}
+
+message SubscribeKvEventsRequest {
+  // Where the consumer stopped; unset when it has no position. Without one,
+  // on_miss decides as for a cursor that cannot be resumed, except that
+  // KV_CURSOR_MISS_FAIL is INVALID_ARGUMENT.
+  optional KvCursor resume = 1;
+  KvCursorMiss on_miss = 2;
+  // Upper bound on one snapshot chunk; 0 selects the server default.
+  uint32 max_chunk_bytes = 3;
+}
+
+message GetKvEventsRequest {
+  KvCursor from = 1;
+  // Exclusive; unset for everything retained.
+  optional uint64 end_seq = 2;
+}
+
+message GetKvSnapshotRequest {
+  uint32 max_chunk_bytes = 1;
+}
+
+message KvStreamItem {
+  oneof item {
+    // Always the first item.
+    KvStreamStart start = 1;
+    KvSnapshotChunk snapshot = 2;
+    KvSnapshotEnd snapshot_end = 3;
+    KvEventBatch batch = 4;
+    // Sent while the stream is idle so a dead connection is noticed.
+    KvHeartbeat heartbeat = 5;
+  }
+}
+
+message KvStreamStart {
+  KvStreamMode mode = 1;
+  KvStreamInfo info = 2;
+  // The first batch this RPC delivers. In SNAPSHOT mode it is also the cut:
+  // the snapshot reflects every batch before it.
+  uint64 next_seq = 3;
+}
+
+// Part of a snapshot. Chunks arrive in `index` order; within and across
+// chunks a block always follows its parent.
+message KvSnapshotChunk {
+  uint32 index = 1;
+  repeated KvBlocksStored stored = 2;
+}
+
+// Ends a snapshot. A consumer stages the chunks and replaces its view of the
+// rank only when this arrives; its cursor is then (publisher_id, next_seq).
+message KvSnapshotEnd {
+  uint32 chunks = 1;
+  uint64 blocks = 2;
+  uint64 next_seq = 3;
+}
+
+message KvHeartbeat {
+  uint64 next_seq = 1;
+}
+
+message KvEventBatch {
+  uint64 seq = 1;
+  // Engine wall clock at the drain, seconds since the epoch.
+  double timestamp = 2;
+  repeated KvCacheEvent events = 3;
+}
+
+message KvCacheEvent {
+  oneof event {
+    KvBlocksStored stored = 1;
+    KvBlocksRemoved removed = 2;
+    KvAllBlocksCleared cleared = 3;
+  }
+}
+
+// A chain of blocks now present in the given tiers.
+message KvBlocksStored {
+  // Block i + 1 is the child of block i.
+  repeated sfixed64 block_hashes = 1;
+  // The parent of block_hashes[0]; unset for a block at the root.
+  optional sfixed64 parent_block_hash = 2;
+  // block_size token ids per block, twice that when `bigram`. int64:
+  // multimodal placeholder ids exceed 32 bits.
+  repeated int64 token_ids = 3;
+  uint32 block_size = 4;
+  // One tier in a live event; in a snapshot, every tier that holds the chain.
+  repeated KvTier tiers = 5;
+  optional string cache_salt = 6;
+  optional string lora_name = 7;
+  // The session whose request stored the blocks. Live events only.
+  optional string session_id = 8;
+  // One entry per block when any block has labeled multimodal tokens.
+  repeated KvMmSpans mm_routing_spans = 9;
+  // The tree is keyed by token bigrams: each position of a block carries its
+  // own token id and the next one.
+  bool bigram = 10;
+}
+
+// The labeled multimodal token runs of one block.
+message KvMmSpans {
+  repeated KvMmSpan spans = 1;
+}
+
+message KvMmSpan {
+  // Token offset inside the block.
+  uint32 start = 1;
+  uint32 length = 2;
+  // The routing label the request gave the multimodal item.
+  string label = 3;
+}
+
+message KvBlocksRemoved {
+  repeated sfixed64 block_hashes = 1;
+  KvTier tier = 2;
+}
+
+// Every block in every tier is gone.
+message KvAllBlocksCleared {}
