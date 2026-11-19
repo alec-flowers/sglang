@@ -124,6 +124,15 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
                     block_size: source.block_size,
                 })
                 .collect(),
+            kv_event_streams: deployment_info
+                .kv_event_streams
+                .into_iter()
+                .map(|stream| api::KvEventStream {
+                    dp_rank: stream.dp_rank,
+                    block_size: stream.block_size,
+                    hash_format: stream.hash_format,
+                })
+                .collect(),
             node_listeners: deployment_info
                 .node_listeners
                 .into_iter()

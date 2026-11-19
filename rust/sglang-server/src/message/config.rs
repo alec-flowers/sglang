@@ -611,6 +611,8 @@ pub struct DeploymentInfo {
     /// The scheduler's KV event publisher this listener relays as
     /// `sglang.kv.v1`. Never reported: its sockets are private to the process.
     pub kv_event_relay: Option<KvEventRelay>,
+    /// The `sglang.kv.v1` streams this listener serves, as reported.
+    pub kv_event_streams: Vec<KvEventStream>,
     pub rust_server_endpoints: Vec<RustServerEndpoint>,
     /// Every Rust listener of this launch on this node; the same table on each.
     pub node_listeners: Vec<NodeRustListener>,
@@ -639,6 +641,13 @@ pub struct KvEventRelay {
     pub dp_rank: u32,
     pub block_size: u32,
     /// `KVEventsConfig.format`: "default" or "dynamo".
+    pub hash_format: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct KvEventStream {
+    pub dp_rank: u32,
+    pub block_size: u32,
     pub hash_format: String,
 }
 

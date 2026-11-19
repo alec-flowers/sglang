@@ -187,6 +187,11 @@ message DeploymentInfo {
   // Every Rust listener this launch runs on this node, in port-offset order.
   // Each of them reports the same list, so one connection finds the rest.
   repeated NodeRustListener node_listeners = 20;
+
+  // The sglang.kv.v1.KvEventService streams this listener's gRPC port
+  // serves: its own rank's, or none. The other ranks' are on the gRPC ports
+  // of node_listeners.
+  repeated KvEventStream kv_event_streams = 21;
 }
 
 // One Rust listener: the HTTP (and native gRPC) server embedded by a DP-group
@@ -206,4 +211,12 @@ message KvEventSource {
   string endpoint = 2;
   string topic = 3;
   uint32 block_size = 4;
+}
+
+message KvEventStream {
+  uint32 dp_rank = 1;
+  // Tokens per block.
+  uint32 block_size = 2;
+  // "default" or "dynamo"; see sglang.kv.v1.KvHashFormat.
+  string hash_format = 3;
 }

@@ -1018,6 +1018,11 @@ pub struct DeploymentInfo {
     /// Each of them reports the same list, so one connection finds the rest.
     #[prost(message, repeated, tag = "20")]
     pub node_listeners: ::prost::alloc::vec::Vec<NodeRustListener>,
+    /// The sglang.kv.v1.KvEventService streams this listener's gRPC port
+    /// serves: its own rank's, or none. The other ranks' are on the gRPC ports
+    /// of node_listeners.
+    #[prost(message, repeated, tag = "21")]
+    pub kv_event_streams: ::prost::alloc::vec::Vec<KvEventStream>,
 }
 /// One Rust listener: the HTTP (and native gRPC) server embedded by a DP-group
 /// leader scheduler.
@@ -1045,4 +1050,15 @@ pub struct KvEventSource {
     pub topic: ::prost::alloc::string::String,
     #[prost(uint32, tag = "4")]
     pub block_size: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct KvEventStream {
+    #[prost(uint32, tag = "1")]
+    pub dp_rank: u32,
+    /// Tokens per block.
+    #[prost(uint32, tag = "2")]
+    pub block_size: u32,
+    /// "default" or "dynamo"; see sglang.kv.v1.KvHashFormat.
+    #[prost(string, tag = "3")]
+    pub hash_format: ::prost::alloc::string::String,
 }

@@ -9,6 +9,7 @@ the router can subscribe per replica (the `dp_size` it reads from
 
 import atexit
 import json
+import os
 import threading
 import time
 import unittest
@@ -19,6 +20,7 @@ from unittest.mock import patch
 import msgspec
 import zmq
 
+from sglang.srt.arg_groups.validation_hook import check_kv_events_grpc_args
 from sglang.srt.disaggregation import kv_events
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -151,9 +153,7 @@ class _RecorderOnlyCache:
 
 
 class TestSchedulerPublishing(CustomTestCase):
-    def _published_payload(self, *, rust):
-        with zmq.Context.instance().socket(zmq.PUB) as probe:
-            port = probe.bind_to_random_port("tcp://*")
+    def _component(self, config, *, rust=False):
         parallel = SimpleNamespace(
             pp_rank=0,
             attn_tp_rank=0,
@@ -162,17 +162,14 @@ class TestSchedulerPublishing(CustomTestCase):
             attn_dp_rank=0,
             dp_rank=2,
         )
-        cache = _RecorderOnlyCache()
         with (
             patch.object(kv_events, "get_parallel", return_value=parallel),
             patch.object(scheduler_publisher, "get_parallel", return_value=parallel),
             envs.SGLANG_USE_RUST_KV_EVENT_PUBLISHER.override(rust),
         ):
             component = scheduler_publisher.SchedulerKvEventsPublisher(
-                kv_events_config=json.dumps(
-                    {"publisher": "zmq", "endpoint": f"tcp://*:{port - 2}"}
-                ),
-                tree_cache=cache,
+                kv_events_config=json.dumps(config),
+                tree_cache=_RecorderOnlyCache(),
                 send_metrics_from_scheduler=None,
                 max_running_requests=1,
                 max_total_num_tokens=1,
@@ -180,6 +177,14 @@ class TestSchedulerPublishing(CustomTestCase):
             )
         atexit.unregister(component.kv_event_publisher.shutdown)
         self.addCleanup(component.kv_event_publisher.shutdown)
+        return component
+
+    def _published_payload(self, *, rust):
+        with zmq.Context.instance().socket(zmq.PUB) as probe:
+            port = probe.bind_to_random_port("tcp://*")
+        component = self._component(
+            {"publisher": "zmq", "endpoint": f"tcp://*:{port - 2}"}, rust=rust
+        )
         self.assertEqual(component.publishes_encoded_batches, rust)
         with (
             zmq.Context() as context,
@@ -190,7 +195,7 @@ class TestSchedulerPublishing(CustomTestCase):
             subscriber.connect(f"tcp://127.0.0.1:{port}")
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
-                cache.kv_events.record_all_cleared()
+                component.tree_cache.kv_events.record_all_cleared()
                 component.publish_kv_events()
                 if subscriber.poll(100):
                     return subscriber.recv_multipart()[2]
@@ -204,6 +209,127 @@ class TestSchedulerPublishing(CustomTestCase):
         self.assertEqual(self._published_payload(rust=True), python_payload)
         batch = msgspec.msgpack.decode(python_payload, type=KVEventBatch)
         self.assertEqual(batch, KVEventBatch(1.5, [AllBlocksCleared()], 2))
+
+    def test_only_the_grpc_publisher_has_a_relay_source(self):
+        # The Rust server starts a relay for exactly this entry, so a "zmq"
+        # launch must not produce one and a "grpc" launch must name the rank,
+        # the block size and the hash format the relay reports.
+        zmq_only = self._component(
+            {"publisher": "zmq", "endpoint": f"tcp://*:{get_free_port()}"}
+        )
+        self.assertIsNone(zmq_only.kv_event_relay_source(16))
+        self.assertEqual(zmq_only.kv_event_streams(16), [])
+        relayed = self._component({"publisher": "grpc", "format": "dynamo"})
+        source = relayed.kv_event_relay_source(16)
+        self.assertTrue(source.pop("endpoint").startswith("ipc://"))
+        self.assertTrue(source.pop("replay_endpoint").startswith("ipc://"))
+        self.assertEqual(
+            source, dict(topic="", dp_rank=2, block_size=16, hash_format="dynamo")
+        )
+        self.assertEqual(
+            relayed.kv_event_streams(16),
+            [dict(dp_rank=2, block_size=16, hash_format="dynamo")],
+        )
+        # Without compat_zmq no socket is offered to ZMQ consumers.
+        self.assertEqual(relayed.local_kv_event_sources(16), [])
+
+
+class TestGrpcPublisher(CustomTestCase):
+    def _publisher(self, **config):
+        publisher = EventPublisherFactory.create(
+            json.dumps({"publisher": "grpc", "format": "dynamo", **config})
+        )
+        atexit.unregister(publisher.shutdown)
+        self.addCleanup(publisher.shutdown)
+        return publisher
+
+    def _replay(self, endpoint):
+        dealer = zmq.Context.instance().socket(zmq.DEALER)
+        dealer.setsockopt(zmq.RCVTIMEO, 5000)
+        dealer.connect(endpoint)
+        self.addCleanup(dealer.close, linger=0)
+        dealer.send_multipart([b"", (0).to_bytes(8, "big")])
+        batches = []
+        while True:
+            _, _, seq, payload = dealer.recv_multipart()
+            seq = int.from_bytes(seq, "big", signed=True)
+            if seq == -1:
+                return batches
+            batches.append((seq, payload))
+
+    def test_relay_and_compat_sockets_carry_the_same_stream(self):
+        # A ZMQ consumer and a consumer of the relayed gRPC stream must agree
+        # on every sequence number, or a cursor from one is wrong for the other.
+        port = get_free_port()
+        publisher = self._publisher(
+            compat_zmq=True,
+            endpoint=f"tcp://*:{port}",
+            replay_endpoint=f"tcp://*:{get_free_port()}",
+        )
+        for block_hash in range(3):
+            removed = BlockRemoved(block_hashes=[block_hash])
+            publisher.publish(KVEventBatch(ts=1.0, events=[removed]))
+        compat = publisher.describe_local_source(16)
+        self.assertEqual(compat["endpoint"], f"tcp://127.0.0.1:{port}")
+        relayed = self._replay(publisher.describe_relay_source(16)["replay_endpoint"])
+        self.assertEqual([seq for seq, _ in relayed], [0, 1, 2])
+        self.assertEqual(self._replay(compat["replay_endpoint"]), relayed)
+
+    def test_private_sockets_are_not_advertised_and_do_not_outlive_shutdown(self):
+        def server_info_block(**config):
+            config = json.dumps({"publisher": "grpc", "format": "dynamo", **config})
+            args = ServerArgs(model_path="dummy", page_size=16, kv_events_config=config)
+            return describe_kv_events_publisher(args)
+
+        self.assertIsNone(server_info_block())
+        # With compat_zmq the block is what a "zmq" launch advertises.
+        self.assertEqual(
+            server_info_block(compat_zmq=True),
+            describe_kv_events_publisher(
+                ServerArgs(
+                    model_path="dummy",
+                    page_size=16,
+                    kv_events_config='{"publisher": "zmq"}',
+                )
+            ),
+        )
+
+        publisher = self._publisher()
+        self.assertIsNone(publisher.describe_local_source(16))
+        socket_path = publisher.describe_relay_source(16)["endpoint"][len("ipc://") :]
+        self.assertTrue(os.path.exists(socket_path))
+        publisher.shutdown()
+        self.assertFalse(os.path.exists(os.path.dirname(socket_path)))
+
+    def test_grpc_publisher_requirements_are_checked_at_startup(self):
+        def check(*, rust_server, grpc_port, **config):
+            config = json.dumps({"publisher": "grpc", "format": "dynamo", **config})
+            args = ServerArgs(
+                model_path="dummy", kv_events_config=config, grpc_port=grpc_port
+            )
+            with envs.SGLANG_RUST_SERVER.override(rust_server):
+                check_kv_events_grpc_args(args)
+
+        check(rust_server=True, grpc_port=30001)
+        # Other publishers are not served by the Rust server.
+        check(rust_server=False, grpc_port=None, publisher="zmq", format="default")
+        for missing, kwargs in (
+            ("SGLANG_RUST_SERVER", dict(rust_server=False, grpc_port=30001)),
+            ("--grpc-port", dict(rust_server=True, grpc_port=None)),
+            ("dynamo", dict(rust_server=True, grpc_port=30001, format="default")),
+            (
+                "compat_zmq",
+                dict(
+                    rust_server=True,
+                    grpc_port=30001,
+                    compat_zmq=True,
+                    endpoint="inproc://kv",
+                ),
+            ),
+        ):
+            with self.subTest(missing=missing):
+                with self.assertRaisesRegex(ValueError, missing):
+                    check(**kwargs)
 
 
 class TestOffsetEndpointPort(CustomTestCase):

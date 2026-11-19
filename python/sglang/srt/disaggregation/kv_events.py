@@ -24,6 +24,8 @@ import ipaddress
 import logging
 import os
 import queue
+import shutil
+import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -391,6 +393,10 @@ class EventPublisher(ABC):
     def shutdown(self) -> None:
         """Shutdown the publisher."""
 
+    # Whether the publisher has `publish_encoded`, taking a batch the cache
+    # recorder encoded itself.
+    accepts_encoded_batches = False
+
     def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
         """Describe a source accessible to a separate local process, if any."""
         return None
@@ -745,7 +751,7 @@ def _rust_publisher_can_bind(endpoint: Optional[str]) -> bool:
     return True
 
 
-def _rust_publisher_can_serve(
+def rust_publisher_can_serve(
     endpoint: str, replay_endpoint: Optional[str], bind: Optional[bool]
 ) -> bool:
     """Whether RustZmqEventPublisher can stand in for ZmqEventPublisher, which
@@ -783,6 +789,8 @@ class RustZmqEventPublisher(EventPublisher):
     reading for a second is disconnected together with the others; they
     reconnect and repair the gap through replay.
     """
+
+    accepts_encoded_batches = True
 
     def __init__(
         self,
@@ -833,11 +841,19 @@ class RustZmqEventPublisher(EventPublisher):
                 dropped,
             )
 
+    @property
+    def bound_endpoint(self) -> str:
+        return self._publisher.local_pub_endpoint
+
+    @property
+    def bound_replay_endpoint(self) -> Optional[str]:
+        return self._publisher.local_replay_endpoint
+
     def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
         return describe_local_kv_event_source(
             dp_rank=self._dp_rank,
-            pub_endpoint=self._publisher.local_pub_endpoint,
-            replay_endpoint=self._publisher.local_replay_endpoint,
+            pub_endpoint=self.bound_endpoint,
+            replay_endpoint=self.bound_replay_endpoint,
             topic=self._topic,
             block_size=block_size,
         )
@@ -846,11 +862,124 @@ class RustZmqEventPublisher(EventPublisher):
         self._publisher.shutdown()
 
 
+# sockaddr_un.sun_path holds 108 bytes on Linux, the terminating NUL included.
+_MAX_IPC_PATH_LEN = 107
+
+
+def _private_socket_dir() -> str:
+    """A new owner-only directory for ipc sockets, short enough to bind in."""
+    longest_socket_name = "replay"
+    for parent in (None, "/tmp"):
+        path = tempfile.mkdtemp(prefix="sglang-kv-", dir=parent)
+        if len(os.path.join(path, longest_socket_name)) <= _MAX_IPC_PATH_LEN:
+            return path
+        os.rmdir(path)
+    raise RuntimeError("no temporary directory short enough for an ipc socket path")
+
+
+class RelayedEventPublisher(EventPublisher):
+    """The publisher of ``publisher: "grpc"``, whose stream the Rust server
+    relays as ``sglang.kv.v1.KvEventService``.
+
+    Batches go out on private ipc sockets that only the relay in this process
+    reads. With ``compat_zmq`` the same batches, under the same sequence
+    numbers, also go out on ``endpoint`` and ``replay_endpoint`` for ZMQ
+    consumers.
+    """
+
+    accepts_encoded_batches = True
+
+    def __init__(
+        self,
+        attn_dp_rank: int,
+        endpoint: str = "tcp://*:5557",
+        replay_endpoint: Optional[str] = None,
+        buffer_steps: int = 10_000,
+        hwm: int = 100_000,
+        max_queue_size: int = 100_000,
+        topic: str = "",
+        bind: Optional[bool] = None,
+        compat_zmq: bool = False,
+    ) -> None:
+        if compat_zmq and not rust_publisher_can_serve(
+            endpoint, replay_endpoint, bind
+        ):
+            raise ValueError(
+                f"compat_zmq needs endpoints the Rust publisher can bind, not "
+                f"{endpoint!r} and {replay_endpoint!r}"
+            )
+        self._dp_rank = attn_dp_rank
+        self._topic = topic
+        self._encoder = msgspec.msgpack.Encoder()
+        self._socket_dir = _private_socket_dir()
+        queues = dict(
+            buffer_steps=buffer_steps,
+            hwm=hwm,
+            max_queue_size=max_queue_size,
+            topic=topic,
+        )
+        self._publishers = [
+            RustZmqEventPublisher(
+                # The directory is this process's own, so no rank suffix.
+                attn_dp_rank=0,
+                endpoint=f"ipc://{self._socket_dir}/pub",
+                replay_endpoint=f"ipc://{self._socket_dir}/replay",
+                **queues,
+            )
+        ]
+        if compat_zmq:
+            self._publishers.append(
+                RustZmqEventPublisher(
+                    attn_dp_rank=attn_dp_rank,
+                    endpoint=endpoint,
+                    replay_endpoint=replay_endpoint,
+                    **queues,
+                )
+            )
+        atexit.register(self.shutdown)
+
+    def publish(self, events: EventBatch) -> None:
+        if events.attn_dp_rank is None:
+            events.attn_dp_rank = self._dp_rank
+        self.publish_encoded(self._encoder.encode(events))
+
+    def publish_encoded(self, payload: bytes) -> None:
+        # Each publisher numbers the batch itself, and each is given every
+        # batch, so the two streams carry the same sequence numbers.
+        for publisher in self._publishers:
+            publisher.publish_encoded(payload)
+
+    def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
+        """The ZMQ source for outside consumers; the relay's is not one."""
+        if len(self._publishers) == 1:
+            return None
+        return self._publishers[1].describe_local_source(block_size)
+
+    def describe_relay_source(self, block_size: int) -> dict[str, Any]:
+        """The private sockets, for the relay in this process."""
+        relay = self._publishers[0]
+        return {
+            "endpoint": relay.bound_endpoint,
+            "replay_endpoint": relay.bound_replay_endpoint,
+            "topic": self._topic,
+            "dp_rank": self._dp_rank,
+            "block_size": block_size,
+        }
+
+    def shutdown(self) -> None:
+        for publisher in self._publishers:
+            publisher.shutdown()
+        shutil.rmtree(self._socket_dir, ignore_errors=True)
+
+
 class KVEventsConfig(BaseModel):
     """Configuration for KV event publishing."""
 
     publisher: str = "null"
-    """The publisher to use for publishing kv events. Can be "null", "zmq".
+    """The publisher to use for publishing kv events. Can be "null", "zmq",
+    "grpc". "grpc" serves the events as sglang.kv.v1.KvEventService on the Rust
+    server's gRPC port; it needs SGLANG_RUST_SERVER=1, --grpc-port and the
+    "dynamo" format.
     """
 
     endpoint: str = "tcp://*:5557"
@@ -885,6 +1014,11 @@ class KVEventsConfig(BaseModel):
     this topic to receive events.
     """
 
+    compat_zmq: bool = False
+    """With the "grpc" publisher, also publish on ``endpoint`` and
+    ``replay_endpoint`` as the "zmq" publisher does, for ZMQ consumers.
+    """
+
     format: Literal["default", "dynamo"] = "default"
     """The event format. "default" is the SGLang format. "dynamo" is the format
     the Dynamo KV router reads: block hashes also depend on extra_key and
@@ -897,6 +1031,12 @@ class KVEventsConfig(BaseModel):
         """Parse the CLI value for the event publisher config."""
         return KVEventsConfig.model_validate_json(cli_value)
 
+    def has_zmq_endpoint(self) -> bool:
+        """Whether ``endpoint`` is a socket outside consumers subscribe to."""
+        if self.publisher == "null" or not self.endpoint:
+            return False
+        return self.publisher != "grpc" or self.compat_zmq
+
 
 def uses_dynamo_format(kv_events_config: Optional[str]) -> bool:
     if not kv_events_config:
@@ -908,6 +1048,7 @@ class EventPublisherFactory:
     _registry: dict[str, Callable[..., EventPublisher]] = {
         "null": NullEventPublisher,
         "zmq": ZmqEventPublisher,
+        "grpc": RelayedEventPublisher,
     }
 
     @classmethod
@@ -925,14 +1066,17 @@ class EventPublisherFactory:
         config_dict = config.model_dump()
         # The cache event recorder uses the format. The publisher does not accept it.
         config_dict.pop("format")
+        compat_zmq = config_dict.pop("compat_zmq")
 
         kind = config_dict.pop("publisher", "null")
         try:
             constructor = cls._registry[kind]
         except KeyError as exc:
             raise ValueError(f"Unknown event publisher '{kind}'") from exc
+        if kind == "grpc":
+            config_dict["compat_zmq"] = compat_zmq
         if kind == "zmq" and envs.SGLANG_USE_RUST_KV_EVENT_PUBLISHER.get():
-            if _rust_publisher_can_serve(
+            if rust_publisher_can_serve(
                 config_dict["endpoint"],
                 config_dict["replay_endpoint"],
                 config_dict["bind"],

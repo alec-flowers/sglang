@@ -50,7 +50,11 @@ def _scheduler_for_typed_config(load_snapshot_writer=None):
         kv_events_publisher=SimpleNamespace(
             local_kv_event_sources=MagicMock(
                 return_value=[{"endpoint": "tcp://127.0.0.1:5557"}]
-            )
+            ),
+            kv_event_relay_source=MagicMock(
+                return_value={"endpoint": "ipc:///run/kv/pub"}
+            ),
+            kv_event_streams=MagicMock(return_value=[{"dp_rank": 0}]),
         ),
         page_size=16,
         tree_cache=None,
@@ -175,6 +179,10 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         extension.ServerArgs.call_args.kwargs["deployment_info"]
     )
     assert deployment_info["kv_event_sources"] == [{"endpoint": "tcp://127.0.0.1:5557"}]
+    # The private relay source travels next to the advertised ones, not in them.
+    scheduler.kv_events_publisher.kv_event_relay_source.assert_called_once_with(16)
+    assert deployment_info["kv_event_relay"] == {"endpoint": "ipc:///run/kv/pub"}
+    assert deployment_info["kv_event_streams"] == [{"dp_rank": 0}]
     assert deployment_info["rust_server_endpoints"] == [
         {"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}
     ]

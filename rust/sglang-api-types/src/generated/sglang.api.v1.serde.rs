@@ -4967,6 +4967,13 @@ impl ::serde::Serialize for DeploymentInfo {
                 &self.node_listeners,
             )?;
         }
+        if !self.kv_event_streams.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "kv_event_streams",
+                &self.kv_event_streams,
+            )?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -5003,6 +5010,7 @@ impl<'de> ::serde::Deserialize<'de> for DeploymentInfo {
                 let mut f_hicache_host_total_tokens = None;
                 let mut f_kv_event_sources = None;
                 let mut f_node_listeners = None;
+                let mut f_kv_event_streams = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "disaggregation_bootstrap_port" => {
@@ -5153,6 +5161,17 @@ impl<'de> ::serde::Deserialize<'de> for DeploymentInfo {
                                     .unwrap_or_default(),
                             );
                         }
+                        "kv_event_streams" => {
+                            if f_kv_event_streams.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "kv_event_streams",
+                                ));
+                            }
+                            f_kv_event_streams = Some(
+                                map.next_value::<Option<Vec<KvEventStream>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -5179,6 +5198,7 @@ impl<'de> ::serde::Deserialize<'de> for DeploymentInfo {
                     hicache_host_total_tokens: f_hicache_host_total_tokens.flatten(),
                     kv_event_sources: f_kv_event_sources.unwrap_or_default(),
                     node_listeners: f_node_listeners.unwrap_or_default(),
+                    kv_event_streams: f_kv_event_streams.unwrap_or_default(),
                 })
             }
         }
@@ -5321,6 +5341,68 @@ impl<'de> ::serde::Deserialize<'de> for KvEventSource {
                     endpoint: f_endpoint.unwrap_or_default(),
                     topic: f_topic.unwrap_or_default(),
                     block_size: f_block_size.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for KvEventStream {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "dp_rank", &self.dp_rank)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "block_size", &self.block_size)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "hash_format", &self.hash_format)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for KvEventStream {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = KvEventStream;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct KvEventStream")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_dp_rank = None;
+                let mut f_block_size = None;
+                let mut f_hash_format = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "dp_rank" => {
+                            if f_dp_rank.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("dp_rank"));
+                            }
+                            f_dp_rank = Some(map.next_value::<u32>()?);
+                        }
+                        "block_size" => {
+                            if f_block_size.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("block_size"));
+                            }
+                            f_block_size = Some(map.next_value::<u32>()?);
+                        }
+                        "hash_format" => {
+                            if f_hash_format.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("hash_format"));
+                            }
+                            f_hash_format =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(KvEventStream {
+                    dp_rank: f_dp_rank.unwrap_or_default(),
+                    block_size: f_block_size.unwrap_or_default(),
+                    hash_format: f_hash_format.unwrap_or_default(),
                 })
             }
         }

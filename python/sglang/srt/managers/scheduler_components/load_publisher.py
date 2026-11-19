@@ -153,7 +153,7 @@ class SchedulerLoadPublisher:
         except Exception:
             # Malformed config: the KV publisher would fail too; stay a no-op.
             return
-        if cfg.publisher == "null" or not cfg.endpoint:
+        if not cfg.has_zmq_endpoint():
             # KV publishing off. Silent: an opted-in server already failed in
             # check_load_publish_args, so reaching here means load publishing
             # wasn't requested (this runs before the resolver sees the mode).

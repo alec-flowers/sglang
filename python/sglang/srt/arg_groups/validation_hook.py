@@ -533,6 +533,7 @@ def check_server_args(server_args: Any):
 
     check_watermark_server_args(server_args)
 
+    check_kv_events_grpc_args(server_args)
     check_load_publish_args(server_args)
     warn_multi_node_kv_events(server_args)
 
@@ -615,10 +616,11 @@ def check_load_publish_args(server_args: Any):
         cfg = KVEventsConfig.from_cli(server_cfg.kv_events_config)
     except Exception as e:
         raise ValueError(f"--kv-events-config is not parseable: {e}")
-    if cfg.publisher == "null" or not cfg.endpoint:
+    if not cfg.has_zmq_endpoint():
         raise ValueError(
             "--load-publish-endpoint needs an active --kv-events-config"
-            " publisher; got publisher='null' or an empty endpoint."
+            " publisher with a ZMQ endpoint; got publisher='null', an empty"
+            " endpoint, or publisher='grpc' without compat_zmq."
         )
     _, reason = resolve_load_pub_range(
         kv_endpoint=cfg.endpoint,
@@ -628,6 +630,45 @@ def check_load_publish_args(server_args: Any):
     )
     if reason:
         raise ValueError(reason)
+
+
+def check_kv_events_grpc_args(server_args: Any) -> None:
+    """The "grpc" KV event publisher is served by the Rust server's gRPC port,
+    from a relay that mirrors the tree by block hash."""
+    from sglang.srt.disaggregation.kv_events import (
+        KVEventsConfig,
+        rust_publisher_can_serve,
+    )
+
+    server_cfg = resolving_view(server_args)
+    if not server_cfg.kv_events_config:
+        return
+    try:
+        cfg = KVEventsConfig.from_cli(server_cfg.kv_events_config)
+    except Exception as e:
+        raise ValueError(f"--kv-events-config is not parseable: {e}")
+    if cfg.publisher != "grpc":
+        return
+    missing = []
+    if not envs.SGLANG_RUST_SERVER.get():
+        missing.append("the Rust server (SGLANG_RUST_SERVER=1)")
+    if server_cfg.grpc_port is None:
+        missing.append("--grpc-port")
+    if cfg.format != "dynamo":
+        # Default-format hashes are shared across requests' extra keys, so a
+        # removal for one of them would drop a block the others still hold.
+        missing.append('"format": "dynamo"')
+    if cfg.compat_zmq and not rust_publisher_can_serve(
+        cfg.endpoint, cfg.replay_endpoint, cfg.bind
+    ):
+        missing.append(
+            "compat_zmq endpoints it can bind (tcp:// on a wildcard or literal IP"
+            " host, or ipc:// paths)"
+        )
+    if missing:
+        raise ValueError(
+            f'--kv-events-config publisher "grpc" requires {", ".join(missing)}.'
+        )
 
 
 def warn_multi_node_kv_events(server_args: Any) -> None:

@@ -2188,7 +2188,7 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
         # have failed at server startup; /server_info must
         # keep working, so just report "no publisher" to consumers.
         return None
-    if cfg.publisher == "null" or not cfg.endpoint:
+    if not cfg.has_zmq_endpoint():
         return None
     resolved_kv = parse_advertisable_tcp(cfg.endpoint)
     if resolved_kv is None:
@@ -2196,7 +2196,9 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     host, port = resolved_kv
 
     descriptor = {
-        "publisher": cfg.publisher,
+        # What this block describes is a ZMQ publisher, also when the "grpc"
+        # publisher keeps one for compat_zmq.
+        "publisher": "zmq" if cfg.publisher == "grpc" else cfg.publisher,
         "endpoint_host": host,
         "endpoint_port_base": port,
         "topic": cfg.topic,

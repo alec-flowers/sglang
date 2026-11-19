@@ -121,6 +121,14 @@ def _build_server_args(
         "kv_event_sources": scheduler.kv_events_publisher.local_kv_event_sources(
             scheduler.page_size * get_parallel().dcp_size
         ),
+        # The scheduler's private publisher, relayed as sglang.kv.v1; null
+        # unless --kv-events-config selects the "grpc" publisher.
+        "kv_event_relay": scheduler.kv_events_publisher.kv_event_relay_source(
+            scheduler.page_size * get_parallel().dcp_size
+        ),
+        "kv_event_streams": scheduler.kv_events_publisher.kv_event_streams(
+            scheduler.page_size * get_parallel().dcp_size
+        ),
         # Every Rust listener of the deployment (`RustServer.gather_server_endpoints`).
         "rust_server_endpoints": scheduler.rust_server_endpoints,
         "node_listeners": _node_listeners(grpc_port=get_serving().grpc_port),

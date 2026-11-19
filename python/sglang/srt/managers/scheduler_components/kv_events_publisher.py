@@ -16,7 +16,8 @@ import zmq
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
-    RustZmqEventPublisher,
+    KVEventsConfig,
+    RelayedEventPublisher,
     is_kv_publisher_rank,
     select_kv_publisher_dp_rank,
 )
@@ -75,8 +76,8 @@ class SchedulerKvEventsPublisher:
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config, self.kv_publisher_dp_rank
             )
-            self.publishes_encoded_batches = isinstance(
-                self.kv_event_publisher, RustZmqEventPublisher
+            self.publishes_encoded_batches = (
+                self.kv_event_publisher.accepts_encoded_batches
             )
 
     def emit_kv_metrics(self):
@@ -116,6 +117,22 @@ class SchedulerKvEventsPublisher:
             return []
         source = self.kv_event_publisher.describe_local_source(block_size)
         return [source] if source is not None else []
+
+    def kv_event_relay_source(self, block_size: int) -> Optional[dict[str, Any]]:
+        """The private publisher the Rust server relays as sglang.kv.v1, if any."""
+        if not isinstance(self.kv_event_publisher, RelayedEventPublisher):
+            return None
+        source = self.kv_event_publisher.describe_relay_source(block_size)
+        source["hash_format"] = KVEventsConfig.from_cli(self.kv_events_config).format
+        return source
+
+    def kv_event_streams(self, block_size: int) -> list[dict[str, Any]]:
+        """The sglang.kv.v1 streams this rank's listener serves, as
+        GetServerInfo reports them."""
+        source = self.kv_event_relay_source(block_size)
+        if source is None:
+            return []
+        return [{key: source[key] for key in ("dp_rank", "block_size", "hash_format")}]
 
     def publish_kv_events(self):
         if not self.enable_kv_cache_events:

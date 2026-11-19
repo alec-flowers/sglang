@@ -821,6 +821,7 @@ class DeploymentInfo(msgspec.Struct, kw_only=True, frozen=True):
     hicache_host_total_tokens: Optional[int] = None
     kv_event_sources: List[KvEventSource] = []
     node_listeners: List[NodeRustListener] = []
+    kv_event_streams: List[KvEventStream] = []
 
     @classmethod
     def from_json_value(cls, value: Any) -> "DeploymentInfo":
@@ -866,6 +867,23 @@ class KvEventSource(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_KvEventSource(self)
+
+
+class KvEventStream(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.KvEventStream: JSON object (unknown keys ignored)."""
+
+    dp_rank: int = 0
+    block_size: int = 0
+    hash_format: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "KvEventStream":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_KvEventStream(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_KvEventStream(self)
 
 
 # ---- type aliases: JSON shapes without an object of their own ----
@@ -2553,6 +2571,8 @@ def decode_DeploymentInfo(value: Any) -> DeploymentInfo:
             kw["kv_event_sources"] = [] if x is None else [decode_KvEventSource(e) for e in _expect_seq(x, expected="a sequence")]
         elif key == "node_listeners":
             kw["node_listeners"] = [] if x is None else [decode_NodeRustListener(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "kv_event_streams":
+            kw["kv_event_streams"] = [] if x is None else [decode_KvEventStream(e) for e in _expect_seq(x, expected="a sequence")]
     return DeploymentInfo(**kw)
 
 
@@ -2589,6 +2609,8 @@ def encode_DeploymentInfo(v: DeploymentInfo) -> Dict[str, Any]:
         d["kv_event_sources"] = [encode_KvEventSource(e) for e in v.kv_event_sources]
     if v.node_listeners:
         d["node_listeners"] = [encode_NodeRustListener(e) for e in v.node_listeners]
+    if v.kv_event_streams:
+        d["kv_event_streams"] = [encode_KvEventStream(e) for e in v.kv_event_streams]
     return d
 
 
@@ -2638,4 +2660,25 @@ def encode_KvEventSource(v: KvEventSource) -> Dict[str, Any]:
     d["endpoint"] = v.endpoint
     d["topic"] = v.topic
     d["block_size"] = v.block_size
+    return d
+
+
+def decode_KvEventStream(value: Any) -> KvEventStream:
+    m = _expect_map(value, expected="struct KvEventStream")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "dp_rank":
+            kw["dp_rank"] = _expect_uint(x, expected="u32")
+        elif key == "block_size":
+            kw["block_size"] = _expect_uint(x, expected="u32")
+        elif key == "hash_format":
+            kw["hash_format"] = _expect_str(x, expected="a string")
+    return KvEventStream(**kw)
+
+
+def encode_KvEventStream(v: KvEventStream) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["dp_rank"] = v.dp_rank
+    d["block_size"] = v.block_size
+    d["hash_format"] = v.hash_format
     return d

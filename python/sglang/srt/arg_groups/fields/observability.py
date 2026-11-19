@@ -142,7 +142,7 @@ class Observability(msgspec.Struct):
     ] = False
     kv_events_config: A[
         Optional[str],
-        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see --load-publish-endpoint. Set replay_endpoint (e.g. tcp://*:5558) to let routers re-fetch dropped batches; /server_info advertises its port.",
+        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see --load-publish-endpoint. Set replay_endpoint (e.g. tcp://*:5558) to let routers re-fetch dropped batches; /server_info advertises its port. With SGLANG_RUST_SERVER=1 and --grpc-port, publisher 'grpc' (with format 'dynamo') serves the events and snapshots of the cache as sglang.kv.v1.KvEventService on the gRPC port instead; add compat_zmq to keep publishing on the ZMQ endpoints as well.",
     ] = None
     load_publish_endpoint: A[
         Optional[str],
