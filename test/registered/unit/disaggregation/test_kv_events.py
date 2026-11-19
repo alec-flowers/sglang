@@ -12,6 +12,7 @@ import json
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import msgspec
@@ -36,6 +37,18 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+WIRE_GOLDEN = (
+    Path(__file__).resolve().parents[4]
+    / "rust"
+    / "sglang-kv-events"
+    / "testdata"
+    / "wire_golden.json"
+)
+KV_EVENT_TYPES = {
+    event_type.__name__: event_type
+    for event_type in (BlockStored, BlockRemoved, AllBlocksCleared)
+}
 
 
 class TestLocalKvEventSource(CustomTestCase):
@@ -172,6 +185,25 @@ class TestBlockStoredWireFormat(CustomTestCase):
         self.assertEqual([e.session_id for e in stored], [None, None, "session-a"])
         self.assertIsInstance(round_tripped.events[3], BlockRemoved)
         self.assertIsInstance(round_tripped.events[4], AllBlocksCleared)
+
+    def test_msgspec_bytes_match_the_rust_codec_fixture(self):
+        # rust/sglang-kv-events must encode the same bytes (tests/wire_golden.rs),
+        # so a schema change here needs the fixture and the Rust codec updated.
+        cases = json.loads(WIRE_GOLDEN.read_text())["cases"]
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                events = []
+                for fields in case["batch"]["events"]:
+                    fields = dict(fields)
+                    events.append(KV_EVENT_TYPES[fields.pop("type")](**fields))
+                batch = KVEventBatch(
+                    ts=case["batch"]["ts"],
+                    events=events,
+                    attn_dp_rank=case["batch"]["attn_dp_rank"],
+                )
+                self.assertEqual(
+                    msgspec.msgpack.encode(batch).hex(), case["msgpack_hex"]
+                )
 
 
 class TestNamespacedBlockHash(CustomTestCase):

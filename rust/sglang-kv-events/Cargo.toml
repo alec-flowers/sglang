@@ -1,0 +1,17 @@
+[package]
+name = "sglang-kv-events"
+description = "KV cache event wire codec for SGLang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "sglang_kv_events"
+
+# The codec has no dependencies on purpose: sglang-radix-tree links it into the
+# libtorch extension, whose dependency set is kept minimal.
+[dependencies]
+
+[dev-dependencies]
+serde_json = { workspace = true }

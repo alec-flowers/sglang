@@ -1,0 +1,277 @@
+{
+ "cases": [
+  {
+   "name": "text_chain",
+   "batch": {
+    "ts": 1731888000.25,
+    "attn_dp_rank": 0,
+    "events": [
+     {
+      "type": "BlockStored",
+      "block_hashes": [
+       1,
+       -2,
+       3
+      ],
+      "parent_block_hash": null,
+      "token_ids": [
+       10,
+       11,
+       12,
+       13,
+       14,
+       15
+      ],
+      "block_size": 2,
+      "lora_id": null,
+      "medium": "GPU"
+     }
+    ]
+   },
+   "msgpack_hex": "93cb41d9cea0e01000009187a474797065ab426c6f636b53746f726564ac626c6f636b5f6861736865739301fe03b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473960a0b0c0d0e0faa626c6f636b5f73697a6502a76c6f72615f6964c0a66d656469756da347505500"
+  },
+  {
+   "name": "integer_widths",
+   "batch": {
+    "ts": 0.0,
+    "attn_dp_rank": 300,
+    "events": [
+     {
+      "type": "BlockStored",
+      "block_hashes": [
+       0,
+       127,
+       128,
+       255,
+       256,
+       65535,
+       65536,
+       4294967295,
+       4294967296,
+       9223372036854775807,
+       -1,
+       -32,
+       -33,
+       -128,
+       -129,
+       -32768,
+       -32769,
+       -2147483648,
+       -2147483649,
+       -9223372036854775808
+      ],
+      "parent_block_hash": -9223372036854775808,
+      "token_ids": [
+       0,
+       127,
+       128,
+       255,
+       256,
+       65535,
+       65536,
+       4294967295,
+       4294967296,
+       9223372036854775807,
+       2305843009214693952,
+       2305843009214693952,
+       2305843009214693952,
+       2305843009214693952,
+       2305843009214693952,
+       2305843009214693952,
+       2305843009214693952,
+       2305843009214693952,
+       2305843009214693952,
+       2305843009214693952
+      ],
+      "block_size": 1,
+      "lora_id": 7,
+      "medium": "CPU_PINNED"
+     }
+    ]
+   },
+   "msgpack_hex": "93cb00000000000000009187a474797065ab426c6f636b53746f726564ac626c6f636b5f686173686573dc0014007fcc80ccffcd0100cdffffce00010000ceffffffffcf0000000100000000cf7fffffffffffffffffe0d0dfd080d1ff7fd18000d2ffff7fffd280000000d3ffffffff7fffffffd38000000000000000b1706172656e745f626c6f636b5f68617368d38000000000000000a9746f6b656e5f696473dc0014007fcc80ccffcd0100cdffffce00010000ceffffffffcf0000000100000000cf7fffffffffffffffcf20000000000f4240cf20000000000f4240cf20000000000f4240cf20000000000f4240cf20000000000f4240cf20000000000f4240cf20000000000f4240cf20000000000f4240cf20000000000f4240cf20000000000f4240aa626c6f636b5f73697a6501a76c6f72615f696407a66d656469756daa4350555f50494e4e4544cd012c"
+  },
+  {
+   "name": "optional_fields_are_omitted_when_unset",
+   "batch": {
+    "ts": 2.0,
+    "attn_dp_rank": 1,
+    "events": [
+     {
+      "type": "BlockStored",
+      "block_hashes": [
+       1
+      ],
+      "parent_block_hash": null,
+      "token_ids": [
+       10,
+       11
+      ],
+      "block_size": 2,
+      "lora_id": null
+     },
+     {
+      "type": "BlockStored",
+      "block_hashes": [
+       1
+      ],
+      "parent_block_hash": null,
+      "token_ids": [
+       10,
+       11
+      ],
+      "block_size": 2,
+      "lora_id": null,
+      "medium": "GPU",
+      "cache_salt": "tenant-a",
+      "session_id": "ssssssssssssssssssssssssssssssssssssssss",
+      "lora_name": "adapter"
+     },
+     {
+      "type": "BlockStored",
+      "block_hashes": [
+       1
+      ],
+      "parent_block_hash": null,
+      "token_ids": [
+       10,
+       11
+      ],
+      "block_size": 2,
+      "lora_id": null,
+      "lora_name": "adapter"
+     },
+     {
+      "type": "BlockStored",
+      "block_hashes": [
+       1
+      ],
+      "parent_block_hash": null,
+      "token_ids": [
+       10,
+       11
+      ],
+      "block_size": 2,
+      "lora_id": null,
+      "medium": "DISK",
+      "cache_salt": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+     },
+     {
+      "type": "BlockStored",
+      "block_hashes": [
+       1
+      ],
+      "parent_block_hash": null,
+      "token_ids": [
+       10,
+       11
+      ],
+      "block_size": 2,
+      "lora_id": null,
+      "medium": "EXTERNAL",
+      "session_id": "session-a"
+     }
+    ]
+   },
+   "msgpack_hex": "93cb40000000000000009586a474797065ab426c6f636b53746f726564ac626c6f636b5f6861736865739101b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473920a0baa626c6f636b5f73697a6502a76c6f72615f6964c08aa474797065ab426c6f636b53746f726564ac626c6f636b5f6861736865739101b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473920a0baa626c6f636b5f73697a6502a76c6f72615f6964c0a66d656469756da3475055aa63616368655f73616c74a874656e616e742d61aa73657373696f6e5f6964d92873737373737373737373737373737373737373737373737373737373737373737373737373737373a96c6f72615f6e616d65a76164617074657287a474797065ab426c6f636b53746f726564ac626c6f636b5f6861736865739101b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473920a0baa626c6f636b5f73697a6502a76c6f72615f6964c0a96c6f72615f6e616d65a76164617074657288a474797065ab426c6f636b53746f726564ac626c6f636b5f6861736865739101b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473920a0baa626c6f636b5f73697a6502a76c6f72615f6964c0a66d656469756da44449534baa63616368655f73616c74da012c78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787888a474797065ab426c6f636b53746f726564ac626c6f636b5f6861736865739101b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473920a0baa626c6f636b5f73697a6502a76c6f72615f6964c0a66d656469756da845585445524e414caa73657373696f6e5f6964a973657373696f6e2d6101"
+  },
+  {
+   "name": "bigram_token_pairs",
+   "batch": {
+    "ts": 3.5,
+    "attn_dp_rank": 0,
+    "events": [
+     {
+      "type": "BlockStored",
+      "block_hashes": [
+       5
+      ],
+      "parent_block_hash": 4,
+      "token_ids": [
+       [
+        1,
+        2
+       ],
+       [
+        2,
+        3
+       ],
+       [
+        3,
+        70000
+       ]
+      ],
+      "block_size": 3,
+      "lora_id": null,
+      "medium": "GPU"
+     }
+    ]
+   },
+   "msgpack_hex": "93cb400c0000000000009187a474797065ab426c6f636b53746f726564ac626c6f636b5f6861736865739105b1706172656e745f626c6f636b5f6861736804a9746f6b656e5f696473939201029202039203ce00011170aa626c6f636b5f73697a6503a76c6f72615f6964c0a66d656469756da347505500"
+  },
+  {
+   "name": "mm_routing_spans",
+   "batch": {
+    "ts": 4.5,
+    "attn_dp_rank": 0,
+    "events": [
+     {
+      "type": "BlockStored",
+      "block_hashes": [
+       8,
+       9
+      ],
+      "parent_block_hash": null,
+      "token_ids": [
+       2305843009214693952,
+       2305843009214693952,
+       20,
+       21
+      ],
+      "block_size": 2,
+      "lora_id": null,
+      "medium": "GPU",
+      "mm_routing_spans": [
+       [
+        [
+         0,
+         2,
+         "0123456789abcdef"
+        ]
+       ],
+       []
+      ]
+     }
+    ]
+   },
+   "msgpack_hex": "93cb40120000000000009188a474797065ab426c6f636b53746f726564ac626c6f636b5f686173686573920809b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f69647394cf20000000000f4240cf20000000000f42401415aa626c6f636b5f73697a6502a76c6f72615f6964c0a66d656469756da3475055b06d6d5f726f7574696e675f7370616e739291930002b0303132333435363738396162636465669000"
+  },
+  {
+   "name": "removed_and_cleared",
+   "batch": {
+    "ts": 5.5,
+    "attn_dp_rank": null,
+    "events": [
+     {
+      "type": "BlockRemoved",
+      "block_hashes": [
+       1,
+       2
+      ],
+      "medium": "GPU"
+     },
+     {
+      "type": "BlockRemoved",
+      "block_hashes": [
+       3
+      ]
+     },
+     {
+      "type": "AllBlocksCleared"
+     }
+    ]
+   },
+   "msgpack_hex": "93cb40160000000000009383a474797065ac426c6f636b52656d6f766564ac626c6f636b5f686173686573920102a66d656469756da347505582a474797065ac426c6f636b52656d6f766564ac626c6f636b5f686173686573910381a474797065b0416c6c426c6f636b73436c6561726564c0"
+  }
+ ]
+}

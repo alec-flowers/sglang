@@ -4010,6 +4010,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sglang-kv-events"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "sglang-mm"
 version = "0.1.0"
 dependencies = [
