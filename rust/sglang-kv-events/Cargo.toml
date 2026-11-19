@@ -62,6 +62,10 @@ zeromq = { version = "0.6", default-features = false, features = [
 [dev-dependencies]
 serde_json = { workspace = true }
 
+[[example]]
+name = "kv_tail"
+required-features = ["relay"]
+
 [[test]]
 name = "publisher"
 required-features = ["publisher"]

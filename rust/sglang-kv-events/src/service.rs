@@ -6,13 +6,25 @@ use sglang_kv_v1_types as pb;
 use sglang_kv_v1_types::kv_event_service_server::KvEventServiceServer;
 use sglang_kv_v1_types::kv_stream_item::Item;
 use tokio::sync::watch;
+use tokio_stream::{Stream, StreamExt};
 use tonic::codegen::BoxStream;
 use tonic::{Request, Response, Status};
 
-use crate::relay::{Admission, Batch, EndReason, RelayError, RelayHandle};
+use crate::mirror;
+use crate::relay::{Admission, Batch, EndReason, RelayError, RelayHandle, SnapshotTicket};
 
 // Arbitrary; an idle stream sends this often so a dead peer is noticed.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+// Arbitrary: under tonic's 4 MiB default for a client's incoming messages.
+const DEFAULT_CHUNK_BYTES: usize = 1024 * 1024;
+const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+fn chunk_limit(requested: u32) -> usize {
+    match requested {
+        0 => DEFAULT_CHUNK_BYTES,
+        requested => (requested as usize).min(MAX_CHUNK_BYTES),
+    }
+}
 
 pub struct KvEventService {
     relay: RelayHandle,
@@ -40,7 +52,6 @@ fn status(error: RelayError) -> Status {
         RelayError::Unavailable => Status::unavailable(message),
         RelayError::OutOfRange { .. } => Status::out_of_range(message),
         RelayError::WrongPublisher { .. } => Status::failed_precondition(message),
-        RelayError::NoSnapshot => Status::unimplemented(message),
         RelayError::NoCursor => Status::invalid_argument(message),
     }
 }
@@ -73,16 +84,49 @@ fn batch(batch: &Batch) -> pb::KvStreamItem {
     item(Item::Batch(pb::KvEventBatch::clone(batch)))
 }
 
-fn follow(admission: Admission, stop: watch::Receiver<bool>) -> BoxStream<pb::KvStreamItem> {
+/// The snapshot as chunks under `max_chunk_bytes`, then the end marker.
+fn snapshot_items(
+    ticket: SnapshotTicket,
+    max_chunk_bytes: usize,
+) -> impl Stream<Item = Result<pb::KvStreamItem, Status>> {
+    async_stream::try_stream! {
+        // The ticket is dropped when history is lost while it is built.
+        let snapshot = ticket.await.map_err(|_| end_status(EndReason::DataLoss))?;
+        let mut chunks = 0;
+        for chunk in mirror::chunks(&snapshot.stores, max_chunk_bytes) {
+            chunks += 1;
+            yield item(Item::Snapshot(chunk));
+        }
+        yield item(Item::SnapshotEnd(pb::KvSnapshotEnd {
+            chunks,
+            blocks: snapshot.blocks,
+            next_seq: snapshot.next_seq,
+        }));
+    }
+}
+
+fn follow(
+    admission: Admission,
+    max_chunk_bytes: usize,
+    stop: watch::Receiver<bool>,
+) -> BoxStream<pb::KvStreamItem> {
     let Admission {
         mode,
         info,
         mut next_seq,
+        snapshot,
         backlog,
         mut live,
     } = admission;
     Box::pin(async_stream::try_stream! {
         yield start(mode, info, next_seq);
+        if let Some(ticket) = snapshot {
+            let items = snapshot_items(ticket, max_chunk_bytes);
+            tokio::pin!(items);
+            while let Some(snapshot_item) = items.next().await {
+                yield snapshot_item?;
+            }
+        }
         for missed in &backlog {
             next_seq = missed.seq + 1;
             yield batch(missed);
@@ -126,7 +170,12 @@ impl pb::kv_event_service_server::KvEventService for KvEventService {
         let on_miss = request.on_miss();
         let admission = self.relay.subscribe(request.resume, on_miss).await;
         let admission = admission.map_err(status)?;
-        Ok(Response::new(follow(admission, self.stop.clone())))
+        let max_chunk_bytes = chunk_limit(request.max_chunk_bytes);
+        Ok(Response::new(follow(
+            admission,
+            max_chunk_bytes,
+            self.stop.clone(),
+        )))
     }
 
     async fn get_kv_events(
@@ -145,5 +194,18 @@ impl pb::kv_event_service_server::KvEventService for KvEventService {
             .chain(batches.into_iter().map(|retained| batch(&retained)))
             .map(Ok);
         Ok(Response::new(Box::pin(tokio_stream::iter(items))))
+    }
+
+    async fn get_kv_snapshot(
+        &self,
+        request: Request<pb::GetKvSnapshotRequest>,
+    ) -> Result<Response<BoxStream<pb::KvStreamItem>>, Status> {
+        let max_chunk_bytes = chunk_limit(request.into_inner().max_chunk_bytes);
+        let (info, next_seq, ticket) = self.relay.snapshot().await.map_err(status)?;
+        let start = start(pb::KvStreamMode::Snapshot, info, next_seq);
+        let items = snapshot_items(ticket, max_chunk_bytes);
+        Ok(Response::new(Box::pin(
+            tokio_stream::once(Ok(start)).chain(items),
+        )))
     }
 }

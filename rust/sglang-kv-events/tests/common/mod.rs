@@ -7,19 +7,19 @@ use bytes::Bytes;
 use sglang_kv_events::publisher::END_SEQ;
 use sglang_kv_events::subscriber::SubscriberConfig;
 use sglang_kv_events::wire::{
-    BlockStored, KvCacheEvent, KvEventBatch, StorageMedium, TokenIds, encode_event_batch,
+    BlockRemoved, BlockStored, KvCacheEvent, KvEventBatch, StorageMedium, TokenIds,
+    encode_event_batch,
 };
 use tokio::time::timeout;
 use zeromq::{PubSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 pub const WAIT: Duration = Duration::from_secs(10);
 
-/// An encoded batch that stores the one block `hash`.
-pub fn payload(hash: u64) -> Bytes {
-    let stored = BlockStored {
-        block_hashes: vec![hash as i64],
-        parent_block_hash: None,
-        token_ids: TokenIds::Unigram(vec![hash as i64]),
+fn stored(block_hashes: Vec<i64>, parent_block_hash: Option<i64>) -> KvCacheEvent {
+    KvCacheEvent::BlockStored(BlockStored {
+        token_ids: TokenIds::Unigram(block_hashes.clone()),
+        block_hashes,
+        parent_block_hash,
         block_size: 1,
         lora_id: None,
         medium: Some(StorageMedium::Gpu),
@@ -27,12 +27,36 @@ pub fn payload(hash: u64) -> Bytes {
         session_id: None,
         lora_name: None,
         mm_routing_spans: None,
-    };
+    })
+}
+
+fn encoded(events: Vec<KvCacheEvent>) -> Bytes {
     Bytes::from(encode_event_batch(&KvEventBatch {
         ts: 1.0,
-        events: vec![KvCacheEvent::BlockStored(stored)],
+        events,
         attn_dp_rank: Some(0),
     }))
+}
+
+/// An encoded batch that stores the one block `hash`.
+pub fn payload(hash: u64) -> Bytes {
+    encoded(vec![stored(vec![hash as i64], None)])
+}
+
+/// Batch `seq` of a tree that grows and shrinks: it appends three blocks to
+/// one long chain, and from the fifth batch on evicts the middle block that
+/// batch `seq - 4` stored.
+pub fn churn_payload(seq: u64) -> Bytes {
+    let first = 3 * seq as i64;
+    let parent = (first > 0).then(|| first - 1);
+    let mut events = vec![stored(vec![first, first + 1, first + 2], parent)];
+    if seq >= 4 {
+        events.push(KvCacheEvent::BlockRemoved(BlockRemoved {
+            block_hashes: vec![first - 11],
+            medium: Some(StorageMedium::Gpu),
+        }));
+    }
+    encoded(events)
 }
 
 /// A publisher that only sends live what the test tells it to, and replays

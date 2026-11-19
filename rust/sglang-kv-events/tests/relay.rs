@@ -18,7 +18,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Channel;
 use tonic::{Code, Streaming};
 
-use common::{WAIT, WithholdingPublisher, payload};
+use common::{WAIT, WithholdingPublisher, churn_payload, payload};
 
 type Client = KvEventServiceClient<Channel>;
 
@@ -303,4 +303,173 @@ async fn consumer_that_does_not_keep_up_is_dropped() {
     // The one queued batch is delivered; the overflow ended the feed.
     assert_eq!(live.recv().await.unwrap().seq, 0);
     assert_eq!(live.recv().await.unwrap_err(), EndReason::Lagged);
+}
+
+/// What a consumer holds: for each block, its parent and the tiers it is in.
+type View = std::collections::BTreeMap<i64, (Option<i64>, Vec<i32>)>;
+
+fn apply_store(view: &mut View, stored: &pb::KvBlocksStored) {
+    let mut parent = stored.parent_block_hash;
+    for hash in &stored.block_hashes {
+        let block = view.entry(*hash).or_insert((parent, Vec::new()));
+        for tier in &stored.tiers {
+            if !block.1.contains(tier) {
+                block.1.push(*tier);
+            }
+        }
+        parent = Some(*hash);
+    }
+}
+
+fn apply_batch(view: &mut View, batch: &pb::KvEventBatch) {
+    use pb::kv_cache_event::Event;
+    for event in &batch.events {
+        match event.event.as_ref().unwrap() {
+            Event::Stored(stored) => apply_store(view, stored),
+            Event::Removed(removed) => {
+                for hash in &removed.block_hashes {
+                    if let Some(block) = view.get_mut(hash) {
+                        block.1.retain(|tier| *tier != removed.tier);
+                        if block.1.is_empty() {
+                            view.remove(hash);
+                        }
+                    }
+                }
+            }
+            Event::Cleared(_) => view.clear(),
+        }
+    }
+}
+
+fn publish_churn(publisher: &Publisher, seqs: std::ops::Range<u64>) {
+    for seq in seqs {
+        assert_eq!(publisher.publish(churn_payload(seq)).unwrap(), seq);
+    }
+}
+
+/// Read a snapshot into a view; returns the view, its cut and its chunk count.
+async fn load_snapshot(stream: &mut Streaming<pb::KvStreamItem>) -> (View, u64, u32) {
+    let mut view = View::new();
+    let mut chunks = 0;
+    loop {
+        match next_event(stream).await {
+            Ok(Item::Snapshot(chunk)) => {
+                assert_eq!(chunk.index, chunks);
+                chunks += 1;
+                for stored in &chunk.stored {
+                    // A consumer links a block to a parent it already holds,
+                    // unless that parent is one of the evicted middle blocks.
+                    let parent = stored.parent_block_hash;
+                    assert!(parent.is_none_or(|p| view.contains_key(&p) || p % 3 == 1));
+                    apply_store(&mut view, stored);
+                }
+            }
+            Ok(Item::SnapshotEnd(end)) => {
+                assert_eq!((end.chunks, end.blocks), (chunks, view.len() as u64));
+                return (view, end.next_seq, chunks);
+            }
+            other => panic!("expected a snapshot item, got {other:?}"),
+        }
+    }
+}
+
+/// Apply the batches `[from, until)` of the stream to the view.
+async fn follow(stream: &mut Streaming<pb::KvStreamItem>, view: &mut View, from: u64, until: u64) {
+    for seq in from..until {
+        let Ok(Item::Batch(batch)) = next_event(stream).await else {
+            panic!("expected batch {seq}");
+        };
+        assert_eq!(batch.seq, seq);
+        apply_batch(view, &batch);
+    }
+}
+
+#[tokio::test]
+async fn snapshot_then_live_leaves_a_consumer_where_the_whole_stream_would() {
+    let publisher = publisher();
+    let relay = relay(source(&publisher), 1024, 1024);
+    let mut client = serve(&relay).await;
+    publish_churn(&publisher, 0..20);
+    let info = info_at(&mut client, 20).await;
+    assert_eq!(info.blocks, 3 * 20 - 16);
+
+    // A consumer with no position loads the tree in several small chunks.
+    let mut request = subscription(None, pb::KvCursorMiss::Snapshot);
+    request.max_chunk_bytes = 200;
+    let mut loaded = client
+        .subscribe_kv_events(request)
+        .await
+        .unwrap()
+        .into_inner();
+    expect_start(&mut loaded, pb::KvStreamMode::Snapshot, 20).await;
+    // These are published while the snapshot is still being read.
+    publish_churn(&publisher, 20..25);
+    let (mut loaded_view, cut, chunks) = load_snapshot(&mut loaded).await;
+    assert!(chunks > 1 && cut == 20);
+    info_at(&mut client, 25).await;
+
+    // The same snapshot serves a later consumer while the history still
+    // reaches its cut; it catches up from the batches after it.
+    let request = subscription(None, pb::KvCursorMiss::Snapshot);
+    let mut reused = client
+        .subscribe_kv_events(request)
+        .await
+        .unwrap()
+        .into_inner();
+    expect_start(&mut reused, pb::KvStreamMode::Snapshot, 20).await;
+    let (mut reused_view, _, _) = load_snapshot(&mut reused).await;
+
+    let from_start = subscription(Some((&info.publisher_id, 0)), pb::KvCursorMiss::Fail);
+    let mut followed = client
+        .subscribe_kv_events(from_start)
+        .await
+        .unwrap()
+        .into_inner();
+    expect_start(&mut followed, pb::KvStreamMode::Events, 0).await;
+    let mut followed_view = View::new();
+
+    publish_churn(&publisher, 25..30);
+    follow(&mut loaded, &mut loaded_view, 20, 30).await;
+    follow(&mut reused, &mut reused_view, 20, 30).await;
+    follow(&mut followed, &mut followed_view, 0, 30).await;
+    assert_eq!(loaded_view, followed_view);
+    assert_eq!(reused_view, followed_view);
+    assert_eq!(
+        info_at(&mut client, 30).await.blocks,
+        followed_view.len() as u64
+    );
+}
+
+#[tokio::test]
+async fn snapshot_rpc_returns_the_tree_at_its_cut_and_ends() {
+    let publisher = publisher();
+    let relay = relay(source(&publisher), 2, 1024);
+    let mut client = serve(&relay).await;
+    publish_churn(&publisher, 0..10);
+    let info = info_at(&mut client, 10).await;
+
+    let request = pb::GetKvSnapshotRequest { max_chunk_bytes: 0 };
+    let mut snapshot = client.get_kv_snapshot(request).await.unwrap().into_inner();
+    expect_start(&mut snapshot, pb::KvStreamMode::Snapshot, 10).await;
+    let (view, cut, _) = load_snapshot(&mut snapshot).await;
+    assert_eq!(cut, 10);
+    assert!(snapshot.message().await.unwrap().is_none());
+
+    // The history kept two batches, so only a snapshot knows the first eight.
+    let mut expected = View::new();
+    for seq in 0..10 {
+        let batch = sglang_kv_events::wire::decode_event_batch(&churn_payload(seq)).unwrap();
+        apply_batch(&mut expected, &sglang_kv_events::convert::batch(seq, batch));
+    }
+    assert_eq!(view, expected);
+
+    // A cursor the history cannot serve falls back to that snapshot by default.
+    let stale = subscription(Some((&info.publisher_id, 1)), pb::KvCursorMiss::Snapshot);
+    let mut stream = client
+        .subscribe_kv_events(stale)
+        .await
+        .unwrap()
+        .into_inner();
+    expect_start(&mut stream, pb::KvStreamMode::Snapshot, 10).await;
+    assert_eq!(load_snapshot(&mut stream).await.0, expected);
 }
