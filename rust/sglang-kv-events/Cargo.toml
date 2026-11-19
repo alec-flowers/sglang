@@ -25,19 +25,31 @@ crate-type = ["cdylib", "rlib"]
 default = []
 # The PUB + ROUTER publisher thread.
 publisher = ["dep:bytes", "dep:thiserror", "dep:tokio", "dep:tracing", "dep:zeromq"]
-# The consumer side: a gap-free reader of the publisher's stream and the
-# history a relay keeps for resuming consumers.
-relay = ["publisher"]
+# The consumer side: a gap-free reader of the publisher's stream, the relay
+# that keeps its history, and the sglang.kv.v1 gRPC service over the relay.
+relay = [
+    "publisher",
+    "dep:async-stream",
+    "dep:sglang-kv-v1-types",
+    "dep:tokio-stream",
+    "dep:tonic",
+    "dep:uuid",
+]
 # Every PyO3 binding.
 python = ["publisher", "dep:pyo3", "dep:tracing-subscriber"]
 
 [dependencies]
+async-stream = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
+sglang-kv-v1-types = { path = "../sglang-kv-v1-types", optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 # Pure Rust, so the extension needs no C++ toolchain; the same crate
 # sgl-router subscribes with.
 zeromq = { version = "0.6", default-features = false, features = [
@@ -54,4 +66,8 @@ required-features = ["publisher"]
 
 [[test]]
 name = "subscriber"
+required-features = ["relay"]
+
+[[test]]
+name = "relay"
 required-features = ["relay"]

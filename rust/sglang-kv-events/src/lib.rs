@@ -2,11 +2,17 @@
 //! and its consumers, and the publisher itself.
 
 #[cfg(feature = "relay")]
+pub mod convert;
+#[cfg(feature = "relay")]
 pub mod history;
 #[cfg(feature = "publisher")]
 pub mod publisher;
 #[cfg(feature = "python")]
 mod python;
+#[cfg(feature = "relay")]
+pub mod relay;
+#[cfg(feature = "relay")]
+pub mod service;
 #[cfg(feature = "relay")]
 pub mod subscriber;
 pub mod wire;

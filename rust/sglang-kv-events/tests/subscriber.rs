@@ -1,14 +1,14 @@
 //! The subscriber against a real publisher: what it must deliver when
 //! PUB/SUB drops batches.
 
-use std::time::Duration;
+mod common;
 
-use bytes::Bytes;
-use sglang_kv_events::publisher::{END_SEQ, Publisher, PublisherConfig};
+use sglang_kv_events::publisher::{Publisher, PublisherConfig};
 use sglang_kv_events::subscriber::{StreamEvent, SubscriberConfig, run_subscriber};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use zeromq::{PubSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+
+use common::{WAIT, WithholdingPublisher, payload};
 
 fn publisher(buffer_steps: usize) -> Publisher {
     Publisher::start(PublisherConfig {
@@ -33,20 +33,20 @@ fn subscribe(publisher: &Publisher) -> mpsc::Receiver<StreamEvent> {
     rx
 }
 
-fn publish(publisher: &Publisher, count: u64) {
-    for _ in 0..count {
-        publisher.publish(Bytes::from_static(b"batch")).unwrap();
+fn publish(publisher: &Publisher, seqs: std::ops::Range<u64>) {
+    for seq in seqs {
+        assert_eq!(publisher.publish(payload(seq)).unwrap(), seq);
     }
 }
 
 async fn next(events: &mut mpsc::Receiver<StreamEvent>) -> StreamEvent {
-    let event = timeout(Duration::from_secs(10), events.recv()).await;
+    let event = timeout(WAIT, events.recv()).await;
     event.expect("no event").expect("subscriber stopped")
 }
 
 async fn expect_batches(events: &mut mpsc::Receiver<StreamEvent>, seqs: std::ops::Range<u64>) {
     for seq in seqs {
-        let payload = Bytes::from_static(b"batch");
+        let payload = payload(seq);
         assert_eq!(next(events).await, StreamEvent::Batch { seq, payload });
     }
 }
@@ -54,72 +54,11 @@ async fn expect_batches(events: &mut mpsc::Receiver<StreamEvent>, seqs: std::ops
 #[tokio::test]
 async fn batches_from_before_the_subscription_arrive_first_and_once() {
     let publisher = publisher(1024);
-    publish(&publisher, 5);
+    publish(&publisher, 0..5);
     let mut events = subscribe(&publisher);
     expect_batches(&mut events, 0..5).await;
-    publish(&publisher, 5);
+    publish(&publisher, 5..10);
     expect_batches(&mut events, 5..10).await;
-}
-
-/// A publisher that only sends live what the test tells it to, and replays
-/// whatever the test has put in its ring.
-struct WithholdingPublisher {
-    live: PubSocket,
-    replay: RouterSocket,
-    ring: Vec<u64>,
-    config: SubscriberConfig,
-}
-
-impl WithholdingPublisher {
-    async fn bind() -> Self {
-        let mut live = PubSocket::new();
-        let endpoint = live.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
-        let mut replay = RouterSocket::new();
-        let replay_endpoint = replay.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
-        let config = SubscriberConfig {
-            endpoint,
-            replay_endpoint,
-            topic: "kv".to_string(),
-        };
-        Self {
-            live,
-            replay,
-            ring: Vec::new(),
-            config,
-        }
-    }
-
-    async fn send_live(&mut self, seq: u64) {
-        let frames = vec![
-            Bytes::from_static(b"kv"),
-            Bytes::copy_from_slice(&seq.to_be_bytes()),
-            Bytes::from_static(b"batch"),
-        ];
-        self.live.send(frames.try_into().unwrap()).await.unwrap();
-    }
-
-    /// Answer the next replay request from the ring; returns its start.
-    async fn serve_replay(&mut self) -> u64 {
-        let request = timeout(Duration::from_secs(10), self.replay.recv()).await;
-        let request = request.expect("no replay request").unwrap().into_vec();
-        let start = u64::from_be_bytes(request[2].as_ref().try_into().unwrap());
-        let reply = |topic: &'static [u8], seq: [u8; 8], payload: &'static [u8]| {
-            let frames = vec![
-                request[0].clone(),
-                Bytes::new(),
-                Bytes::from_static(topic),
-                Bytes::copy_from_slice(&seq),
-                Bytes::from_static(payload),
-            ];
-            ZmqMessage::try_from(frames).unwrap()
-        };
-        for seq in self.ring.iter().filter(|seq| **seq >= start) {
-            let message = reply(b"kv", seq.to_be_bytes(), b"batch");
-            self.replay.send(message).await.unwrap();
-        }
-        self.replay.send(reply(b"", END_SEQ, b"")).await.unwrap();
-        start
-    }
 }
 
 #[tokio::test]
@@ -147,7 +86,7 @@ async fn withheld_live_batches_are_recovered_including_the_last() {
 #[tokio::test]
 async fn batches_evicted_from_the_ring_are_reported_lost() {
     let publisher = publisher(2);
-    publish(&publisher, 10);
+    publish(&publisher, 0..10);
     let mut events = subscribe(&publisher);
     let lost = StreamEvent::Lost {
         expected: 0,
