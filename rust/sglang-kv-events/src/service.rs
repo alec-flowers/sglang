@@ -5,6 +5,7 @@ use std::time::Duration;
 use sglang_kv_v1_types as pb;
 use sglang_kv_v1_types::kv_event_service_server::KvEventServiceServer;
 use sglang_kv_v1_types::kv_stream_item::Item;
+use tokio::sync::watch;
 use tonic::codegen::BoxStream;
 use tonic::{Request, Response, Status};
 
@@ -15,11 +16,21 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct KvEventService {
     relay: RelayHandle,
+    stop: watch::Receiver<bool>,
 }
 
 impl KvEventService {
-    pub fn new(relay: RelayHandle) -> KvEventServiceServer<Self> {
-        KvEventServiceServer::new(Self { relay })
+    /// Open streams end with UNAVAILABLE once `stop` turns true, so a server
+    /// closing its listeners does not wait on them.
+    pub fn new(relay: RelayHandle, stop: watch::Receiver<bool>) -> KvEventServiceServer<Self> {
+        KvEventServiceServer::new(Self { relay, stop })
+    }
+}
+
+async fn stopped(mut stop: watch::Receiver<bool>) {
+    if stop.wait_for(|stop| *stop).await.is_err() {
+        // The sender is gone without asking for a stop.
+        std::future::pending::<()>().await;
     }
 }
 
@@ -62,7 +73,7 @@ fn batch(batch: &Batch) -> pb::KvStreamItem {
     item(Item::Batch(pb::KvEventBatch::clone(batch)))
 }
 
-fn follow(admission: Admission) -> BoxStream<pb::KvStreamItem> {
+fn follow(admission: Admission, stop: watch::Receiver<bool>) -> BoxStream<pb::KvStreamItem> {
     let Admission {
         mode,
         info,
@@ -77,14 +88,21 @@ fn follow(admission: Admission) -> BoxStream<pb::KvStreamItem> {
             yield batch(missed);
         }
         drop(backlog);
+        let stopped = stopped(stop);
+        tokio::pin!(stopped);
         loop {
-            match tokio::time::timeout(HEARTBEAT_INTERVAL, live.recv()).await {
-                Ok(Ok(live_batch)) => {
+            let received = tokio::select! {
+                received = tokio::time::timeout(HEARTBEAT_INTERVAL, live.recv()) => Some(received),
+                () = &mut stopped => None,
+            };
+            match received {
+                Some(Ok(Ok(live_batch))) => {
                     next_seq = live_batch.seq + 1;
                     yield batch(&live_batch);
                 }
-                Ok(Err(reason)) => Err(end_status(reason))?,
-                Err(_idle) => yield item(Item::Heartbeat(pb::KvHeartbeat { next_seq })),
+                Some(Ok(Err(reason))) => Err(end_status(reason))?,
+                Some(Err(_idle)) => yield item(Item::Heartbeat(pb::KvHeartbeat { next_seq })),
+                None => Err(Status::unavailable("the server is shutting down"))?,
             }
         }
     })
@@ -107,7 +125,8 @@ impl pb::kv_event_service_server::KvEventService for KvEventService {
         let request = request.into_inner();
         let on_miss = request.on_miss();
         let admission = self.relay.subscribe(request.resume, on_miss).await;
-        Ok(Response::new(follow(admission.map_err(status)?)))
+        let admission = admission.map_err(status)?;
+        Ok(Response::new(follow(admission, self.stop.clone())))
     }
 
     async fn get_kv_events(

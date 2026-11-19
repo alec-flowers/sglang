@@ -12,6 +12,7 @@ use sglang_kv_events::subscriber::SubscriberConfig;
 use sglang_kv_v1_types as pb;
 use sglang_kv_v1_types::kv_event_service_client::KvEventServiceClient;
 use sglang_kv_v1_types::kv_stream_item::Item;
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Channel;
@@ -55,9 +56,13 @@ fn relay(source: SubscriberConfig, history_max_batches: usize, consumer_queue: u
 }
 
 async fn serve(relay: &Relay) -> Client {
+    serve_until(relay, watch::channel(false).1).await
+}
+
+async fn serve_until(relay: &Relay, stop: watch::Receiver<bool>) -> Client {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let service = KvEventService::new(relay.handle());
+    let service = KvEventService::new(relay.handle(), stop);
     tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(service)
@@ -258,6 +263,24 @@ async fn lost_history_ends_streams_and_starts_a_new_publisher_id() {
     let stale = subscription(Some((&before.publisher_id, 1)), pb::KvCursorMiss::Fail);
     let status = client.subscribe_kv_events(stale).await.unwrap_err();
     assert_eq!(status.code(), Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn open_streams_end_when_the_server_stops() {
+    let publisher = publisher();
+    let relay = relay(source(&publisher), 1024, 1024);
+    let (stop, stopped) = watch::channel(false);
+    let mut client = serve_until(&relay, stopped).await;
+    let request = subscription(None, pb::KvCursorMiss::LiveOnly);
+    let mut stream = client
+        .subscribe_kv_events(request)
+        .await
+        .unwrap()
+        .into_inner();
+    expect_start(&mut stream, pb::KvStreamMode::LiveOnly, 0).await;
+
+    stop.send(true).unwrap();
+    assert_eq!(next_event(&mut stream).await, Err(Code::Unavailable));
 }
 
 #[tokio::test]

@@ -53,6 +53,8 @@ pub struct Runtime {
     core: crate::api_server::handlers::CoreHandle,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// The `sglang.kv.v1` relay of this rank's KV events, when configured.
+    kv_event_relay: Option<sglang_kv_events::relay::Relay>,
     /// The single shutdown sender.
     shutdown_tx: Mutex<Option<flume::Sender<()>>>,
     /// Disconnects with `shutdown_tx`, ending a [`Runtime::wait_startup_failure`].
@@ -300,6 +302,9 @@ impl Runtime {
     /// Stop the runtime and join every worker thread (with a bounded wait).
     pub fn request_shutdown(&self) {
         drop(self.shutdown_tx.lock().unwrap().take());
+        if let Some(relay) = &self.kv_event_relay {
+            relay.shutdown();
+        }
         // Idempotent: a `Drop` after an explicit shutdown finds nothing to join.
         let handles = std::mem::take(&mut *self.threads.lock().unwrap());
         if !join_all_with_timeout(handles, SHUTDOWN_JOIN_TIMEOUT) {
@@ -315,6 +320,43 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         self.request_shutdown();
     }
+}
+
+// Arbitrary. The same count the publisher's replay ring keeps, capped by
+// bytes because one batch can hold a whole prompt's blocks.
+const KV_HISTORY_MAX_BATCHES: usize = 10_000;
+const KV_HISTORY_MAX_BYTES: usize = 256 * 1024 * 1024;
+// Arbitrary; a consumer this far behind resumes from its cursor instead.
+const KV_CONSUMER_QUEUE: usize = 4096;
+
+fn start_kv_event_relay(
+    source: &crate::message::config::KvEventRelay,
+    cpus: Option<rustix::thread::CpuSet>,
+) -> Result<sglang_kv_events::relay::Relay, String> {
+    use sglang_kv_events::relay::{Relay, RelayConfig};
+    use sglang_kv_events::subscriber::SubscriberConfig;
+    use sglang_kv_v1_types::KvHashFormat;
+
+    let hash_format = match source.hash_format.as_str() {
+        "default" => KvHashFormat::Default,
+        "dynamo" => KvHashFormat::Dynamo,
+        other => return Err(format!("unknown KV event hash format {other:?}")),
+    };
+    let config = RelayConfig {
+        source: SubscriberConfig {
+            endpoint: source.endpoint.clone(),
+            replay_endpoint: source.replay_endpoint.clone(),
+            topic: source.topic.clone(),
+        },
+        dp_rank: source.dp_rank,
+        block_size: source.block_size,
+        hash_format,
+        history_max_batches: KV_HISTORY_MAX_BATCHES,
+        history_max_bytes: KV_HISTORY_MAX_BYTES,
+        consumer_queue: KV_CONSUMER_QUEUE,
+    };
+    Relay::start_with(config, move || pin_current(cpus.as_ref()))
+        .map_err(|error| format!("cannot start the KV event relay: {error}"))
 }
 
 /// Send the drain-ended datagram to the abstract Unix socket `name`; best
@@ -418,6 +460,12 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                 .map_err(|e| format!("binding gRPC listener on {addr} failed: {e}"))?,
         ),
         None => None,
+    };
+    // The service is served on the gRPC port, so without one there is nobody
+    // to relay to.
+    let kv_event_relay = match &cfg.server_args.deployment_info.kv_event_relay {
+        Some(source) if grpc_listener.is_some() => Some(start_kv_event_relay(source, cpus)?),
+        _ => None,
     };
 
     // --- Detokenizer shards (pinned, CPU bound) ---
@@ -575,7 +623,11 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                 &cfg.server_args,
                 hicache_manager.clone(),
             );
-            (listener, service)
+            (
+                listener,
+                service,
+                kv_event_relay.as_ref().map(|relay| relay.handle()),
+            )
         });
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
@@ -602,10 +654,16 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                         hicache_manager,
                         tokenizer.clone(),
                     );
-                    if let Some((listener, service)) = grpc_server {
+                    if let Some((listener, service, kv_events)) = grpc_server {
                         tokio::join!(
                             http,
-                            api_server::grpc::app::serve(listener, service, core, shutdown_rx)
+                            api_server::grpc::app::serve(
+                                listener,
+                                service,
+                                kv_events,
+                                core,
+                                shutdown_rx
+                            )
                         );
                     } else {
                         http.await;
@@ -655,6 +713,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         },
         core,
         threads: Mutex::new(threads),
+        kv_event_relay,
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
         shutdown_rx,
         startup_failure_rx,
@@ -2182,6 +2241,114 @@ mod tests {
 
         rt.request_shutdown();
         assert!(std::net::TcpStream::connect(grpc_addr).is_err());
+    }
+
+    /// The KV event service is on the gRPC port exactly when the launch names
+    /// a publisher to relay, and it serves that publisher's batches.
+    #[test]
+    fn kv_event_service_relays_the_configured_publisher() {
+        use sglang_kv_events::publisher::{Publisher, PublisherConfig};
+        use sglang_kv_events::wire::{KvCacheEvent, KvEventBatch, encode_event_batch};
+        use sglang_kv_v1_types as kv;
+        use sglang_kv_v1_types::kv_event_service_client::KvEventServiceClient;
+        use tonic::Code;
+
+        // ipc sockets in a private directory, as the scheduler's publisher uses.
+        let sockets = std::env::temp_dir().join(format!("kv-relay-{}", std::process::id()));
+        std::fs::create_dir_all(&sockets).unwrap();
+        let publisher = Publisher::start(PublisherConfig {
+            endpoint: format!("ipc://{}/pub", sockets.display()),
+            replay_endpoint: Some(format!("ipc://{}/replay", sockets.display())),
+            topic: "kv".into(),
+            buffer_steps: 16,
+            max_queue_size: 16,
+            hwm: 16,
+        })
+        .unwrap();
+        let cleared = encode_event_batch(&KvEventBatch {
+            ts: 1.0,
+            events: vec![KvCacheEvent::AllBlocksCleared],
+            attn_dp_rank: Some(1),
+        });
+        publisher.publish(cleared.into()).unwrap();
+        // The entry as `SchedulerKvEventsPublisher.kv_event_relay_source`
+        // builds it; null when the launch has no "grpc" publisher.
+        let relay = serde_json::json!({
+            "endpoint": publisher.local_pub_endpoint(),
+            "replay_endpoint": publisher.local_replay_endpoint(),
+            "topic": "kv",
+            "dp_rank": 1,
+            "block_size": 16,
+            "hash_format": "dynamo",
+        });
+
+        for relay in [serde_json::Value::Null, relay] {
+            let relayed = !relay.is_null();
+            let (http_addr, grpc_addr) = free_loopback_addrs();
+            let mut server_args = test_server_args();
+            server_args.deployment_info =
+                serde_json::from_value(serde_json::json!({ "kv_event_relay": relay })).unwrap();
+            let cfg = RuntimeConfig {
+                server_args: Arc::new(server_args),
+                ..test_config(http_addr, Some(grpc_addr))
+            };
+            let rt = start(cfg, None).expect("start runtime");
+            let client_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            client_runtime.block_on(async {
+                let channel =
+                    tonic::transport::Endpoint::from_shared(format!("http://{grpc_addr}"))
+                        .unwrap()
+                        .connect()
+                        .await
+                        .expect("connect gRPC client");
+                let mut client = KvEventServiceClient::new(channel);
+                let info = client.get_kv_stream_info(kv::GetKvStreamInfoRequest {});
+                let info = info.await.map(tonic::Response::into_inner);
+                if !relayed {
+                    assert_eq!(info.unwrap_err().code(), Code::Unimplemented);
+                    return;
+                }
+                let info = info.unwrap();
+                assert_eq!(
+                    (info.dp_rank, info.block_size, info.hash_format()),
+                    (1, 16, kv::KvHashFormat::Dynamo)
+                );
+                // The batch published before the server started is replayed.
+                let request = kv::SubscribeKvEventsRequest {
+                    resume: Some(kv::KvCursor {
+                        publisher_id: info.publisher_id,
+                        next_seq: 0,
+                    }),
+                    on_miss: kv::KvCursorMiss::Fail as i32,
+                    max_chunk_bytes: 0,
+                };
+                let mut stream = client
+                    .subscribe_kv_events(request)
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let next = async {
+                    loop {
+                        let item = stream.message().await.unwrap().unwrap().item.unwrap();
+                        if let kv::kv_stream_item::Item::Batch(batch) = item {
+                            return batch;
+                        }
+                    }
+                };
+                let batch = tokio::time::timeout(std::time::Duration::from_secs(10), next)
+                    .await
+                    .expect("no KV event batch");
+                assert_eq!(batch.seq, 0);
+                let cleared = kv::kv_cache_event::Event::Cleared(kv::KvAllBlocksCleared {});
+                assert_eq!(batch.events[0].event, Some(cleared));
+            });
+            rt.request_shutdown();
+        }
+        publisher.shutdown();
+        std::fs::remove_dir_all(&sockets).unwrap();
     }
 
     /// Tonic's unbounded graceful-drain API waits for open HTTP/2 connections.

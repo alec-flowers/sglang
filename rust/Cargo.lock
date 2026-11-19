@@ -4224,6 +4224,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sglang-api-types",
+ "sglang-kv-events",
+ "sglang-kv-v1-types",
  "sglang-mm",
  "sglang-processor",
  "sha2",

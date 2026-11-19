@@ -6,6 +6,8 @@
 //! [`crate::api_server::handlers::CoreHandle`] contract.
 
 use sglang_api_types::api::v1::sglang_service_server::SglangServiceServer;
+use sglang_kv_events::relay::RelayHandle;
+use sglang_kv_events::service::KvEventService;
 use tokio_stream::wrappers::TcpListenerStream;
 
 use super::service::GrpcService;
@@ -52,6 +54,7 @@ fn max_message_size() -> usize {
 pub(crate) async fn serve(
     listener: std::net::TcpListener,
     service: GrpcService,
+    kv_events: Option<RelayHandle>,
     core: CoreHandle,
     shutdown: flume::Receiver<()>,
 ) {
@@ -68,12 +71,22 @@ pub(crate) async fn serve(
     let service = SglangServiceServer::new(service)
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size);
+    let (stop_kv_streams, kv_streams_stopped) = tokio::sync::watch::channel(false);
+    let kv_events = kv_events.map(|relay| {
+        KvEventService::new(relay, kv_streams_stopped)
+            .max_decoding_message_size(max_message_size)
+            .max_encoding_message_size(max_message_size)
+    });
     let serve = tonic::transport::Server::builder()
         .add_service(service)
+        .add_optional_service(kv_events)
         .serve_with_incoming_shutdown(incoming, {
             let core = core.clone();
             async move {
                 core.drain_ended().await;
+                // A KV event stream never finishes by itself; end them so the
+                // graceful close does not wait out its timeout on them.
+                let _ = stop_kv_streams.send(true);
             }
         });
 

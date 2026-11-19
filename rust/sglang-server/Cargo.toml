@@ -69,6 +69,9 @@ rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 # Already in the tree; `/weights_checker`'s `per_engine_checksum`.
 sha2 = "0.10"
+# The relay that re-publishes the scheduler's KV events as sglang.kv.v1.
+sglang_kv_events = { package = "sglang-kv-events", path = "../sglang-kv-events", features = ["relay"] }
+sglang_kv_v1_types = { package = "sglang-kv-v1-types", path = "../sglang-kv-v1-types" }
 # The pure-Rust core of the MM pipeline. `default-features = false` drops the
 # pyo3 bindings so it links as a plain rlib; renamed so `use sglang_mm::…` reads
 # naturally while the crate keeps its own artifact name in the shared target/.

@@ -111,6 +111,14 @@ pub struct RelayHandle {
 
 impl Relay {
     pub fn start(config: RelayConfig) -> std::io::Result<Self> {
+        Self::start_with(config, || {})
+    }
+
+    /// `on_thread_start` runs first on the relay thread, e.g. to pin it.
+    pub fn start_with(
+        config: RelayConfig,
+        on_thread_start: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<Self> {
         let (commands, command_rx) = mpsc::channel(64);
         let (stop_tx, stop_rx) = oneshot::channel();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -119,6 +127,7 @@ impl Relay {
         let thread = std::thread::Builder::new()
             .name("kv-relay".to_string())
             .spawn(move || {
+                on_thread_start();
                 runtime.block_on(async {
                     tokio::select! {
                         () = run(config, command_rx) => {}
