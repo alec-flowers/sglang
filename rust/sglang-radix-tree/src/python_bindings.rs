@@ -1,7 +1,7 @@
 //! Python bindings: the `mem_cache` extension module and its TreeCore adapter.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 
@@ -23,7 +23,64 @@ use crate::unified_tree_core::{
     InsertResult, InsertStepResult, MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName,
     PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
 };
-use crate::unified_tree_core::{KvCacheEvent, WireTokens};
+use crate::unified_tree_core::{KvCacheEvent, KvEventLabels, WireTokens};
+
+/// Python lookups for what published KV events carry that the tree does not
+/// hold. A missing lookup means no event can need it.
+struct KvEventLookups<'a, 'py> {
+    /// `extra_key -> Optional[str]`: the adapter name of a namespace.
+    lora_name: Option<&'a Bound<'py, PyAny>>,
+    /// `token -> Optional[str]`: the routing label of a multimodal pad token.
+    mm_label: Option<&'a Bound<'py, PyAny>>,
+    /// Tokens below this are text and are never looked up.
+    mm_pad_shift: i64,
+}
+
+impl KvEventLookups<'_, '_> {
+    /// Look up what `events` need, once per distinct namespace and pad token.
+    fn resolve<'e, A: WireTokens + 'e>(
+        &self,
+        events: impl Iterator<Item = &'e KvCacheEvent<A>>,
+    ) -> PyResult<KvEventLabels> {
+        let mut labels = KvEventLabels::default();
+        let mut seen_keys: HashSet<&str> = HashSet::new();
+        let mut seen_tokens: HashSet<i64> = HashSet::new();
+        let found = |lookup: &Bound<'_, PyAny>, key: Bound<'_, PyAny>| {
+            let value = lookup.call1((key,))?.extract::<Option<String>>()?;
+            PyResult::Ok(value.map(std::sync::Arc::<str>::from))
+        };
+        for event in events {
+            let (extra_key, token_ids) = match event {
+                KvCacheEvent::BlockStored {
+                    extra_key,
+                    token_ids,
+                    ..
+                } => (extra_key, Some(token_ids)),
+                KvCacheEvent::BlockRemoved { extra_key, .. } => (extra_key, None),
+                KvCacheEvent::AllBlocksCleared => continue,
+            };
+            if let (Some(lookup), Some(extra_key)) = (self.lora_name, extra_key)
+                && seen_keys.insert(extra_key)
+                && let Some(name) =
+                    found(lookup, extra_key.as_ref().into_bound_py_any(lookup.py())?)?
+            {
+                labels.lora_names.insert(extra_key.clone(), name);
+            }
+            let tokens = token_ids.and_then(|tokens| A::unigrams(tokens));
+            let (Some(lookup), Some(tokens)) = (self.mm_label, tokens) else {
+                continue;
+            };
+            for &token in tokens.iter().filter(|token| **token >= self.mm_pad_shift) {
+                if seen_tokens.insert(token)
+                    && let Some(label) = found(lookup, token.into_bound_py_any(lookup.py())?)?
+                {
+                    labels.mm_labels.insert(token, label);
+                }
+            }
+        }
+        Ok(labels)
+    }
+}
 
 /// Translate only Rust panics; ordinary Python errors pass through unchanged.
 /// Keep this boundary outside the whole binding call so its MutexGuard unwinds
@@ -2139,33 +2196,6 @@ macro_rules! tree_core_methods {
                 for<'py> Vec<K::Atom>: IntoPyObject<'py>,
             {
                 let events = py.detach(|| self.core().take_events());
-                Self::tagged_events(py, events)
-            }
-
-            /// The whole tree as batches of tagged tuples, replacing the queue.
-            fn take_resync_events(
-                &self,
-                py: Python<'_>,
-                max_batch_blocks: usize,
-            ) -> PyResult<Py<PyList>>
-            where
-                for<'py> Vec<K::Atom>: IntoPyObject<'py>,
-            {
-                let batches = py.detach(|| self.core().take_resync_events(max_batch_blocks));
-                let list = PyList::empty(py);
-                for events in batches {
-                    list.append(Self::tagged_events(py, events)?)?;
-                }
-                Ok(list.unbind())
-            }
-
-            fn tagged_events(
-                py: Python<'_>,
-                events: Vec<KvCacheEvent<K::Atom>>,
-            ) -> PyResult<Py<PyList>>
-            where
-                for<'py> Vec<K::Atom>: IntoPyObject<'py>,
-            {
                 let list = PyList::empty(py);
                 for event in events {
                     match event {
@@ -2217,58 +2247,69 @@ macro_rules! tree_core_methods {
             }
 
             /// Drain the queued placement events as one encoded `KVEventBatch`, or
-            /// None when the queue is empty. Events go out as recorded; a caller that
-            /// must add LoRA names or routing spans uses `take_events` instead.
+            /// None when the queue is empty: the bytes msgspec gives for the
+            /// events the Python recorder builds from `take_events`.
             fn take_events_encoded(
                 &self,
                 py: Python<'_>,
                 ts: f64,
                 attn_dp_rank: Option<u32>,
-            ) -> Option<Py<PyBytes>>
+                lookups: &KvEventLookups<'_, '_>,
+            ) -> PyResult<Option<Py<PyBytes>>>
             where
                 K::Atom: WireTokens,
             {
-                let payload = py.detach(|| {
-                    let events = self.core().take_events();
-                    if events.is_empty() {
-                        return None;
-                    }
-                    let events = events.into_iter().map(KvCacheEvent::into_wire).collect();
-                    Some(encode_event_batch(&KvEventBatch {
-                        ts,
-                        events,
-                        attn_dp_rank,
-                    }))
-                })?;
-                Some(PyBytes::new(py, &payload).unbind())
+                let events = py.detach(|| self.core().take_events());
+                if events.is_empty() {
+                    return Ok(None);
+                }
+                let payloads = self.encode_event_batches(py, vec![events], ts, attn_dp_rank, lookups)?;
+                Ok(payloads.into_iter().next())
             }
 
-            /// The whole tree as encoded `KVEventBatch`es, replacing the queue;
-            /// the same caveat as `take_events_encoded`.
+            /// The whole tree as encoded `KVEventBatch`es, replacing the queue.
             fn take_resync_events_encoded(
                 &self,
                 py: Python<'_>,
                 ts: f64,
                 attn_dp_rank: Option<u32>,
                 max_batch_blocks: usize,
-            ) -> Vec<Py<PyBytes>>
+                lookups: &KvEventLookups<'_, '_>,
+            ) -> PyResult<Vec<Py<PyBytes>>>
             where
                 K::Atom: WireTokens,
             {
+                let batches = py.detach(|| self.core().take_resync_events(max_batch_blocks));
+                self.encode_event_batches(py, batches, ts, attn_dp_rank, lookups)
+            }
+
+            fn encode_event_batches(
+                &self,
+                py: Python<'_>,
+                batches: Vec<Vec<KvCacheEvent<K::Atom>>>,
+                ts: f64,
+                attn_dp_rank: Option<u32>,
+                lookups: &KvEventLookups<'_, '_>,
+            ) -> PyResult<Vec<Py<PyBytes>>>
+            where
+                K::Atom: WireTokens,
+            {
+                let labels = lookups.resolve(batches.iter().flatten())?;
+                let dynamo_format = self.core_attached(py).dynamo_kv_event_format;
                 let payloads: Vec<Vec<u8>> = py.detach(|| {
-                    let batches = self.core().take_resync_events(max_batch_blocks);
                     let encode = |events: Vec<KvCacheEvent<K::Atom>>| {
-                        let events = events.into_iter().map(KvCacheEvent::into_wire).collect();
+                        let events = events.into_iter();
+                        let events = events.map(|event| event.into_wire(&labels, dynamo_format));
                         encode_event_batch(&KvEventBatch {
                             ts,
-                            events,
+                            events: events.collect(),
                             attn_dp_rank,
                         })
                     };
                     batches.into_iter().map(encode).collect()
                 });
                 let payloads = payloads.iter();
-                payloads.map(|payload| PyBytes::new(py, payload).unbind()).collect()
+                Ok(payloads.map(|payload| PyBytes::new(py, payload).unbind()).collect())
             }
 
             /// Drop the subtree rooted at an unbacked D-leaf; not dropped when a lock
@@ -3586,38 +3627,59 @@ macro_rules! tree_core_binding {
             }
 
             /// Drain the queued placement events as one encoded `KVEventBatch`.
-            #[pyo3(signature = (ts, attn_dp_rank))]
+            /// `lora_name(extra_key)` and `mm_label(token)` return the adapter
+            /// name and the routing label, or None; tokens below `mm_pad_shift`
+            /// are text.
+            #[pyo3(signature = (ts, attn_dp_rank, lora_name=None, mm_label=None, mm_pad_shift=0))]
             fn take_events_encoded(
                 &self,
                 py: Python<'_>,
                 ts: f64,
                 attn_dp_rank: Option<u32>,
+                lora_name: Option<&Bound<'_, PyAny>>,
+                mm_label: Option<&Bound<'_, PyAny>>,
+                mm_pad_shift: i64,
             ) -> PyResult<Option<Py<PyBytes>>> {
-                catch_native_panic(|| Ok(self.inner.take_events_encoded(py, ts, attn_dp_rank)))
+                let lookups = KvEventLookups {
+                    lora_name,
+                    mm_label,
+                    mm_pad_shift,
+                };
+                catch_native_panic(|| {
+                    self.inner
+                        .take_events_encoded(py, ts, attn_dp_rank, &lookups)
+                })
             }
 
-            /// The whole tree as batches of tagged tuples, replacing the queue.
-            fn take_resync_events(
-                &self,
-                py: Python<'_>,
-                max_batch_blocks: usize,
-            ) -> PyResult<Py<PyList>> {
-                catch_native_panic(|| self.inner.take_resync_events(py, max_batch_blocks))
-            }
-
-            /// The whole tree as encoded `KVEventBatch`es, replacing the queue.
-            #[pyo3(signature = (ts, attn_dp_rank, max_batch_blocks))]
+            /// The whole tree as encoded `KVEventBatch`es, replacing the queue;
+            /// the lookups are those of `take_events_encoded`.
+            #[pyo3(signature = (
+                ts, attn_dp_rank, max_batch_blocks, lora_name=None, mm_label=None, mm_pad_shift=0
+            ))]
+            #[allow(clippy::too_many_arguments)]
             fn take_resync_events_encoded(
                 &self,
                 py: Python<'_>,
                 ts: f64,
                 attn_dp_rank: Option<u32>,
                 max_batch_blocks: usize,
+                lora_name: Option<&Bound<'_, PyAny>>,
+                mm_label: Option<&Bound<'_, PyAny>>,
+                mm_pad_shift: i64,
             ) -> PyResult<Vec<Py<PyBytes>>> {
+                let lookups = KvEventLookups {
+                    lora_name,
+                    mm_label,
+                    mm_pad_shift,
+                };
                 catch_native_panic(|| {
-                    Ok(self
-                        .inner
-                        .take_resync_events_encoded(py, ts, attn_dp_rank, max_batch_blocks))
+                    self.inner.take_resync_events_encoded(
+                        py,
+                        ts,
+                        attn_dp_rank,
+                        max_batch_blocks,
+                        &lookups,
+                    )
                 })
             }
 

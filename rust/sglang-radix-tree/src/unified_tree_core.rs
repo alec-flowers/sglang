@@ -6721,13 +6721,20 @@ const KV_EVENT_NAMESPACE_SEED_TAG: &[u8] = b"sglang-kv-event-namespace-v1";
 
 /// The seed for `namespaced_block_hash`, or None for no namespace.
 pub(crate) fn kv_event_namespace_seed(namespace: &KeyNamespace) -> Option<HashDigest> {
-    if *namespace == KeyNamespace::default() {
+    kv_event_namespace_seed_of(namespace.extra_key(), namespace.cache_salt())
+}
+
+fn kv_event_namespace_seed_of(
+    extra_key: Option<&str>,
+    cache_salt: Option<&str>,
+) -> Option<HashDigest> {
+    if extra_key.is_none() && cache_salt.is_none() {
         return None;
     }
     let mut hasher = Sha256::new();
     hasher.update(KV_EVENT_NAMESPACE_SEED_TAG);
     // The presence byte and the length prefix make ("a", "bc") and ("ab", "c") differ.
-    for part in [namespace.extra_key(), namespace.cache_salt()] {
+    for part in [extra_key, cache_salt] {
         match part {
             None => hasher.update([0u8]),
             Some(part) => {
@@ -6778,11 +6785,19 @@ pub enum KvCacheEvent<A> {
 /// Token atoms in the shape the wire codec publishes them.
 pub trait WireTokens: Sized {
     fn into_token_ids(tokens: Vec<Self>) -> wire::TokenIds;
+
+    /// The tokens when each is one id; multimodal pad tokens are only labeled
+    /// in that shape.
+    fn unigrams(tokens: &[Self]) -> Option<&[i64]>;
 }
 
 impl WireTokens for i64 {
     fn into_token_ids(tokens: Vec<Self>) -> wire::TokenIds {
         wire::TokenIds::Unigram(tokens)
+    }
+
+    fn unigrams(tokens: &[Self]) -> Option<&[i64]> {
+        Some(tokens)
     }
 }
 
@@ -6790,15 +6805,81 @@ impl WireTokens for (i64, i64) {
     fn into_token_ids(tokens: Vec<Self>) -> wire::TokenIds {
         wire::TokenIds::Bigram(tokens)
     }
+
+    fn unigrams(_tokens: &[Self]) -> Option<&[i64]> {
+        None
+    }
+}
+
+/// What published events carry that the tree does not hold, for the events of
+/// one drain.
+#[derive(Default)]
+pub struct KvEventLabels {
+    /// extra_key -> adapter name, for the namespaces that have one.
+    pub lora_names: HashMap<Arc<str>, Arc<str>>,
+    /// Multimodal pad token -> routing label, for the tokens that have one.
+    pub mm_labels: HashMap<i64, Arc<str>>,
+}
+
+impl KvEventLabels {
+    /// Per-block runs of labeled pad tokens; None when no token is labeled.
+    fn mm_routing_spans(
+        &self,
+        tokens: &[i64],
+        block_size: usize,
+    ) -> Option<Vec<Vec<wire::MmRoutingSpan>>> {
+        if self.mm_labels.is_empty() || block_size == 0 {
+            return None;
+        }
+        let span = |start: usize, end: usize, label: &Arc<str>| wire::MmRoutingSpan {
+            start: start as u32,
+            length: (end - start) as u32,
+            label: label.clone(),
+        };
+        let mut any_span = false;
+        let block_spans = |block: &[i64]| {
+            let mut spans = Vec::new();
+            let mut run: Option<(usize, &Arc<str>)> = None;
+            for (position, token) in block.iter().enumerate() {
+                let label = self.mm_labels.get(token);
+                if label == run.map(|(_, label)| label) {
+                    continue;
+                }
+                if let Some((start, label)) = run {
+                    spans.push(span(start, position, label));
+                }
+                run = label.map(|label| (position, label));
+            }
+            if let Some((start, label)) = run {
+                spans.push(span(start, block.len(), label));
+            }
+            any_span |= !spans.is_empty();
+            spans
+        };
+        let per_block: Vec<_> = tokens.chunks(block_size).map(block_spans).collect();
+        any_span.then_some(per_block)
+    }
 }
 
 impl<A: WireTokens> KvCacheEvent<A> {
-    /// The published event. `extra_key` stays behind: it only selects the LoRA
-    /// namespace, which the Python recorder applies when adapters are named.
-    pub fn into_wire(self) -> wire::KvCacheEvent {
+    /// The published event, as the Python recorder builds it from `take_events`.
+    /// The dynamo format namespaced an adapter's hashes in the tree and labels
+    /// multimodal tokens; the default format namespaces a named adapter's
+    /// hashes here.
+    pub fn into_wire(self, labels: &KvEventLabels, dynamo_format: bool) -> wire::KvCacheEvent {
         let wire_medium = |medium| match medium {
             StorageMedium::Gpu => wire::StorageMedium::Gpu,
             StorageMedium::Cpu => wire::StorageMedium::CpuPinned,
+        };
+        let lora_name = |extra_key: &Option<Arc<str>>| {
+            let extra_key = extra_key.as_ref()?;
+            labels.lora_names.get(extra_key).cloned()
+        };
+        let named_lora_seed = |extra_key: &Option<Arc<str>>, named: bool| {
+            if dynamo_format || !named {
+                return None;
+            }
+            kv_event_namespace_seed_of(extra_key.as_deref(), /* cache_salt = */ None)
         };
         match self {
             KvCacheEvent::BlockStored {
@@ -6809,27 +6890,39 @@ impl<A: WireTokens> KvCacheEvent<A> {
                 medium,
                 cache_salt,
                 session_id,
-                extra_key: _,
-            } => wire::KvCacheEvent::BlockStored(wire::BlockStored {
-                block_hashes,
-                parent_block_hash,
-                token_ids: A::into_token_ids(token_ids),
-                block_size: u32::try_from(block_size).expect("page size fits u32"),
-                lora_id: None,
-                medium: Some(wire_medium(medium)),
-                cache_salt,
-                session_id,
-                lora_name: None,
-                mm_routing_spans: None,
-            }),
+                extra_key,
+            } => {
+                let lora_name = lora_name(&extra_key);
+                let seed = named_lora_seed(&extra_key, lora_name.is_some());
+                let namespaced = |hash| namespaced_block_hash(seed.as_ref(), hash);
+                let mm_routing_spans = A::unigrams(&token_ids)
+                    .filter(|_| dynamo_format)
+                    .and_then(|tokens| labels.mm_routing_spans(tokens, block_size));
+                wire::KvCacheEvent::BlockStored(wire::BlockStored {
+                    block_hashes: block_hashes.into_iter().map(namespaced).collect(),
+                    parent_block_hash: parent_block_hash.map(namespaced),
+                    token_ids: A::into_token_ids(token_ids),
+                    block_size: u32::try_from(block_size).expect("page size fits u32"),
+                    lora_id: None,
+                    medium: Some(wire_medium(medium)),
+                    cache_salt,
+                    session_id,
+                    lora_name,
+                    mm_routing_spans,
+                })
+            }
             KvCacheEvent::BlockRemoved {
                 block_hashes,
                 medium,
-                extra_key: _,
-            } => wire::KvCacheEvent::BlockRemoved(wire::BlockRemoved {
-                block_hashes,
-                medium: Some(wire_medium(medium)),
-            }),
+                extra_key,
+            } => {
+                let seed = named_lora_seed(&extra_key, lora_name(&extra_key).is_some());
+                let namespaced = |hash| namespaced_block_hash(seed.as_ref(), hash);
+                wire::KvCacheEvent::BlockRemoved(wire::BlockRemoved {
+                    block_hashes: block_hashes.into_iter().map(namespaced).collect(),
+                    medium: Some(wire_medium(medium)),
+                })
+            }
             KvCacheEvent::AllBlocksCleared => wire::KvCacheEvent::AllBlocksCleared,
         }
     }

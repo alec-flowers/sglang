@@ -2404,39 +2404,33 @@ def _named_lora_table():
     return lora_names
 
 
-# name -> (tree core params, event script, whether the binding encodes it itself)
+# name -> (tree core params, event script)
 _ENCODED_EVENT_CASES = {
-    "text": (dict(page_size=2), _text_events, True),
+    "text": (dict(page_size=2), _text_events),
     # A multimodal pad value: wider than 32 bits.
     "wide_token": (
         dict(page_size=1),
         lambda core: _insert(core, [1_000_000 + 2**61], [10]),
-        True,
     ),
     "salted": (
         dict(page_size=2),
         lambda core: _insert_key(core, cache_salt="tenant-a"),
-        True,
     ),
     "dynamo_namespaced": (
         dict(page_size=2, dynamo_kv_event_format=True),
         lambda core: _insert_key(core, extra_key="user-1", cache_salt="tenant-a"),
-        True,
     ),
     "bigram": (
         dict(page_size=2, is_eagle=True),
         lambda core: _insert_key(core, is_bigram=True),
-        True,
     ),
     "host_tier": (
         dict(page_size=1),
         lambda core: _tlru_insert(core, [1, 2], [100, 101], "host"),
-        True,
     ),
     "named_lora": (
         dict(page_size=2, kv_event_lora_names=_named_lora_table()),
         lambda core: _insert_key(core, extra_key="user-" + "a" * 32),
-        False,
     ),
     "dynamo_named_lora": (
         dict(
@@ -2445,7 +2439,6 @@ _ENCODED_EVENT_CASES = {
             kv_event_lora_names=_named_lora_table(),
         ),
         lambda core: _insert_key(core, extra_key="user-" + "a" * 32),
-        False,
     ),
 }
 
@@ -2454,13 +2447,12 @@ _ENCODED_EVENT_CASES = {
 def test_encoded_events_are_the_msgspec_bytes_of_take_events(case):
     """The Rust publisher sends what take_encoded_events returns, so it must be
     byte for byte what the Python publisher sends for the same events."""
-    params, script, encodes_natively = _ENCODED_EVENT_CASES[case]
+    params, script = _ENCODED_EVENT_CASES[case]
     reference, encoded = (
         _tree_core(enable_kv_cache_events=True, **params) for _ in range(2)
     )
     script(reference)
     script(encoded)
-    assert encoded.kv_events.encodes_natively() == encodes_natively
     payload = encoded.take_encoded_events(ts=1.5, attn_dp_rank=3)
     assert payload is not None
     assert payload == encode_kv_event_batch(
@@ -2510,9 +2502,8 @@ def _blocks_after(payloads) -> dict:
 @pytest.mark.parametrize("case", sorted(set(_ENCODED_EVENT_CASES) - {"text"}))
 def test_resync_batches_rebuild_what_the_event_stream_built(case):
     """A consumer that lost events folds the resync batches instead, so they
-    must leave it where the stream would have, whichever of the two encoders
-    the recorder is using."""
-    params, script, _ = _ENCODED_EVENT_CASES[case]
+    must leave it where the stream would have, adapter names included."""
+    params, script = _ENCODED_EVENT_CASES[case]
     core = _tree_core(enable_kv_cache_events=True, **params)
     assert core.supports_kv_event_resync()
     script(core)
@@ -2526,22 +2517,40 @@ def test_resync_batches_rebuild_what_the_event_stream_built(case):
     assert core.take_events() == []
 
 
-def test_encoded_events_carry_routing_spans_once_a_label_is_registered(monkeypatch):
-    """The binding has no routing labels, so it must stop encoding events
-    itself as soon as one exists, or labeled blocks lose their spans."""
-    monkeypatch.setattr(mem_cache_events, "MM_ROUTING_LABELS", MmRoutingLabels())
-    pad = 1_000_000 + 2**61
-    core = _tree_core(
-        enable_kv_cache_events=True, page_size=1, dynamo_kv_event_format=True
+def test_encoded_events_label_multimodal_tokens_as_take_events_does(monkeypatch):
+    """Routing labels live in a Python table the binding looks up while it
+    encodes. Its spans must be those of the Python recorder: one run per label,
+    cut at block boundaries, and none for a label that has expired."""
+    labels = MmRoutingLabels(capacity=2)
+    monkeypatch.setattr(mem_cache_events, "MM_ROUTING_LABELS", labels)
+    pad_a, pad_b, pad_c = (1_000_000 + 2**61 + offset for offset in range(3))
+    labels.register([pad_a, pad_b], "image-1")
+    reference, encoded = (
+        _tree_core(
+            enable_kv_cache_events=True, page_size=2, dynamo_kv_event_format=True
+        )
+        for _ in range(2)
     )
-    assert core.kv_events.encodes_natively()
-    mem_cache_events.MM_ROUTING_LABELS.register([pad], "label-a")
-    assert not core.kv_events.encodes_natively()
-    _insert(core, [pad], [10])
-    batch = msgspec.msgpack.decode(
-        core.take_encoded_events(ts=1.5, attn_dp_rank=0), type=KVEventBatch
-    )
-    assert batch.events[0].mm_routing_spans == [[(0, 1, "label-a")]]
+
+    def assert_same_bytes():
+        payload = encoded.take_encoded_events(ts=1.5, attn_dp_rank=0)
+        assert payload == encode_kv_event_batch(
+            reference.take_events(), ts=1.5, attn_dp_rank=0
+        )
+        return msgspec.msgpack.decode(payload, type=KVEventBatch).events
+
+    # Two pad values of one image form one run; it spans a block boundary.
+    for core in (reference, encoded):
+        _insert(core, [7, pad_a, pad_b, 8], [10, 11, 12, 13])
+    (stored,) = assert_same_bytes()
+    assert stored.mm_routing_spans == [[(1, 1, "image-1")], [(0, 1, "image-1")]]
+
+    # A new label pushes pad_a out of the table: its tokens lose their span.
+    labels.register([pad_c], "image-2")
+    for core in (reference, encoded):
+        _insert(core, [9, pad_a, pad_c, pad_c], [20, 21, 22, 23])
+    (stored,) = assert_same_bytes()
+    assert stored.mm_routing_spans == [[], [(0, 2, "image-2")]]
 
 
 def test_match_result_mamba_fields_are_inert_without_mamba():

@@ -184,6 +184,11 @@ def mm_routing_labels_registered() -> bool:
     return bool(MM_ROUTING_LABELS)
 
 
+def mm_routing_label(pad_value: int) -> Optional[str]:
+    """The routing label of a multimodal pad token, if it has one."""
+    return MM_ROUTING_LABELS.get(pad_value)
+
+
 def enable_mm_routing_labels() -> None:
     """Record routing labels: this process records dynamo-format KV events."""
     MM_ROUTING_LABELS.enabled = True

@@ -14,11 +14,11 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     StorageMedium,
-    encode_kv_event_batch,
     kv_event_namespace_seed,
     namespaced_block_hash,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.events import (
     KvEventLoraNames,
     enable_mm_routing_labels,
+    mm_routing_label,
     mm_routing_labels_registered,
     mm_routing_spans,
 )
@@ -397,21 +398,28 @@ class _RustKVCacheEventRecorder:
         ]
         return events
 
-    def encodes_natively(self) -> bool:
-        """Whether the binding's own encoding equals `take` plus msgspec. It has
-        neither the LoRA names nor the multimodal routing labels, so it cannot
-        once either exists."""
-        return self._lora_names.is_empty() and not (
-            self._dynamo_format and mm_routing_labels_registered()
-        )
+    def _label_lookups(self) -> tuple:
+        """The binding's lookups for what the tree does not hold, and the first
+        pad token: an adapter's name by extra_key, a pad token's routing label.
+        None skips a lookup no event can need."""
+        lora_name = None
+        if not self._lora_names.is_empty():
+            lora_name = (
+                self._lora_names.resolve
+                if self._dynamo_format
+                else self._lora_names.get
+            )
+        labeled = self._dynamo_format and mm_routing_labels_registered()
+        return lora_name, (mm_routing_label if labeled else None), MM_PAD_SHIFT_VALUE
 
     def take_encoded(
         self, *, ts: float, attn_dp_rank: Optional[int]
     ) -> Optional[bytes]:
-        """Take all events as one encoded batch; None when there are none."""
-        if self.encodes_natively():
-            return self._binding.take_events_encoded(ts, attn_dp_rank)
-        return encode_kv_event_batch(self.take(), ts=ts, attn_dp_rank=attn_dp_rank)
+        """Take all events as one encoded batch; None when there are none. The
+        bytes are those msgspec gives for `take`."""
+        return self._binding.take_events_encoded(
+            ts, attn_dp_rank, *self._label_lookups()
+        )
 
     supports_resync = True
 
@@ -420,21 +428,9 @@ class _RustKVCacheEventRecorder:
     ) -> list[bytes]:
         """Replace the queued events with encoded batches that rebuild the whole
         tree: an AllBlocksCleared, then a store of every resident block."""
-        if self.encodes_natively():
-            return self._binding.take_resync_events_encoded(
-                ts, attn_dp_rank, _RESYNC_BATCH_BLOCKS
-            )
-        return [
-            encode_kv_event_batch(
-                [
-                    _kv_event_from_tagged(event, self._lora_names, self._dynamo_format)
-                    for event in batch
-                ],
-                ts=ts,
-                attn_dp_rank=attn_dp_rank,
-            )
-            for batch in self._binding.take_resync_events(_RESYNC_BATCH_BLOCKS)
-        ]
+        return self._binding.take_resync_events_encoded(
+            ts, attn_dp_rank, _RESYNC_BATCH_BLOCKS, *self._label_lookups()
+        )
 
 
 class RustUnifiedTreeCore(UnifiedTreeCoreInterface):

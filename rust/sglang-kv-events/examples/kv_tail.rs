@@ -85,14 +85,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let info = info.into_inner();
     println!(
-        "stream publisher_id={} dp_rank={} block_size={} history=[{}, {}) blocks={} complete={}",
+        "stream publisher_id={} dp_rank={} block_size={} history=[{}, {}) blocks={} complete={} \
+         reseed_supported={}",
         info.publisher_id,
         info.dp_rank,
         info.block_size,
         info.oldest_seq,
         info.next_seq,
         info.blocks,
-        info.complete
+        info.complete,
+        info.reseed_supported
     );
 
     let (resume, on_miss) = match mode.as_str() {
