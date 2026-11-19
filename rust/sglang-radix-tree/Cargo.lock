@@ -613,11 +613,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sglang-kv-events"
+version = "0.1.0"
+
+[[package]]
 name = "sglang-radix-tree"
 version = "0.1.0"
 dependencies = [
  "hashbrown",
  "pyo3",
+ "sglang-kv-events",
  "sha2",
  "tch",
  "thiserror",

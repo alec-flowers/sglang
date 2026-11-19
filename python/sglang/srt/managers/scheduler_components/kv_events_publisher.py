@@ -16,6 +16,7 @@ import zmq
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
+    RustZmqEventPublisher,
     is_kv_publisher_rank,
     select_kv_publisher_dp_rank,
 )
@@ -55,6 +56,9 @@ class SchedulerKvEventsPublisher:
     get_stats: Callable
     enable_kv_cache_events: bool = False
     kv_event_publisher: Any = None
+    kv_publisher_dp_rank: int = 0
+    # The Rust publisher takes payloads the cache recorder encodes itself.
+    publishes_encoded_batches: bool = False
     metrics_drop_warned: bool = False
 
     def __post_init__(self) -> None:
@@ -65,11 +69,14 @@ class SchedulerKvEventsPublisher:
 
         if self.enable_kv_cache_events:
             parallel = get_parallel()
+            self.kv_publisher_dp_rank = select_kv_publisher_dp_rank(
+                parallel.attn_dp_size, parallel.attn_dp_rank, parallel.dp_rank
+            )
             self.kv_event_publisher = EventPublisherFactory.create(
-                kv_events_config,
-                select_kv_publisher_dp_rank(
-                    parallel.attn_dp_size, parallel.attn_dp_rank, parallel.dp_rank
-                ),
+                kv_events_config, self.kv_publisher_dp_rank
+            )
+            self.publishes_encoded_batches = isinstance(
+                self.kv_event_publisher, RustZmqEventPublisher
             )
 
     def emit_kv_metrics(self):
@@ -112,6 +119,14 @@ class SchedulerKvEventsPublisher:
 
     def publish_kv_events(self):
         if not self.enable_kv_cache_events:
+            return
+
+        if self.publishes_encoded_batches:
+            payload = self.tree_cache.take_encoded_events(
+                ts=time.time(), attn_dp_rank=self.kv_publisher_dp_rank
+            )
+            if payload is not None:
+                self.kv_event_publisher.publish_encoded(payload)
             return
 
         events = self.tree_cache.take_events()

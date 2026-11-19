@@ -10,19 +10,20 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyAssertionError, PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
+use sglang_kv_events::wire::{KvEventBatch, encode_event_batch};
 use tch::{Device, Kind, Tensor};
 
 use crate::components::{ComponentSet, ComponentType, FULL, Family, MAMBA, SWA};
 use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
 use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
-use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
     BufferBackupSnapshot, BufferBackupState, CacheAction, CacheActions, CacheInitParams,
     CacheTransferPhase, DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams,
     InsertResult, InsertStepResult, MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName,
     PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
 };
+use crate::unified_tree_core::{KvCacheEvent, WireTokens};
 
 /// Translate only Rust panics; ordinary Python errors pass through unchanged.
 /// Keep this boundary outside the whole binding call so its MutexGuard unwinds
@@ -2188,6 +2189,33 @@ macro_rules! tree_core_methods {
                 Ok(list.unbind())
             }
 
+            /// Drain the queued placement events as one encoded `KVEventBatch`, or
+            /// None when the queue is empty. Events go out as recorded; a caller that
+            /// must add LoRA names or routing spans uses `take_events` instead.
+            fn take_events_encoded(
+                &self,
+                py: Python<'_>,
+                ts: f64,
+                attn_dp_rank: Option<u32>,
+            ) -> Option<Py<PyBytes>>
+            where
+                K::Atom: WireTokens,
+            {
+                let payload = py.detach(|| {
+                    let events = self.core().take_events();
+                    if events.is_empty() {
+                        return None;
+                    }
+                    let events = events.into_iter().map(KvCacheEvent::into_wire).collect();
+                    Some(encode_event_batch(&KvEventBatch {
+                        ts,
+                        events,
+                        attn_dp_rank,
+                    }))
+                })?;
+                Some(PyBytes::new(py, &payload).unbind())
+            }
+
             /// Drop the subtree rooted at an unbacked D-leaf; not dropped when a lock
             /// blocks it.
             fn drop_subtree_no_host(
@@ -3500,6 +3528,17 @@ macro_rules! tree_core_binding {
             /// Drain the queued placement events as tagged tuples.
             fn take_events(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
                 catch_native_panic(|| self.inner.take_events(py))
+            }
+
+            /// Drain the queued placement events as one encoded `KVEventBatch`.
+            #[pyo3(signature = (ts, attn_dp_rank))]
+            fn take_events_encoded(
+                &self,
+                py: Python<'_>,
+                ts: f64,
+                attn_dp_rank: Option<u32>,
+            ) -> PyResult<Option<Py<PyBytes>>> {
+                catch_native_panic(|| Ok(self.inner.take_events_encoded(py, ts, attn_dp_rank)))
             }
 
             /// Drop the subtree rooted at an unbacked D-leaf; not dropped when a lock

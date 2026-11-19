@@ -351,6 +351,20 @@ class KVEventBatch(EventBatch):
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
 
 
+_BATCH_ENCODER = msgspec.msgpack.Encoder()
+
+
+def encode_kv_event_batch(
+    events: list, *, ts: float, attn_dp_rank: Optional[int]
+) -> Optional[bytes]:
+    """The wire payload of one batch, or None when there is nothing to publish."""
+    if not events:
+        return None
+    return _BATCH_ENCODER.encode(
+        KVEventBatch(ts=ts, events=events, attn_dp_rank=attn_dp_rank)
+    )
+
+
 class EventPublisher(ABC):
     """
     Lightweight publisher for EventBatch batches with
@@ -807,7 +821,7 @@ class RustZmqEventPublisher(EventPublisher):
         self.publish_encoded(self._encoder.encode(events))
 
     def publish_encoded(self, payload: bytes) -> None:
-        """Publish an already encoded batch."""
+        """Publish a batch a cache recorder has already encoded."""
         self._publisher.publish(payload)
         dropped = self._publisher.dropped_batches
         # Warn at 1, 2, 4, ... drops, so a sustained overflow does not flood the log.

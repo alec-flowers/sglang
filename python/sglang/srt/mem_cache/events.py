@@ -29,6 +29,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     StorageMedium,
+    encode_kv_event_batch,
     kv_event_namespace_seed,
     namespaced_block_hash,
 )
@@ -70,6 +71,9 @@ class LoRANameTable:
     def register(self, *, lora_id: str, lora_name: str) -> None:
         self._names[lora_id] = lora_name
 
+    def is_empty(self) -> bool:
+        return not self._names
+
     def get(self, extra_key: Optional[str]) -> Optional[str]:
         return self.resolve(extra_key)
 
@@ -109,6 +113,9 @@ class KvEventLoraNames(LoRANameTable):
         if not lora_name:
             return
         self._names[req.extra_key] = lora_name
+
+    def is_empty(self) -> bool:
+        return not self._names and not self._adapter_names
 
     def get(self, extra_key: Optional[str]) -> Optional[str]:
         return self._names.get(extra_key)
@@ -170,6 +177,11 @@ class MmRoutingLabels:
 
 
 MM_ROUTING_LABELS = MmRoutingLabels()
+
+
+def mm_routing_labels_registered() -> bool:
+    """Whether any KV event may now carry routing spans."""
+    return bool(MM_ROUTING_LABELS)
 
 
 def enable_mm_routing_labels() -> None:
@@ -470,3 +482,9 @@ class KVCacheEventRecorder:
         events = self._queue
         self._queue = []
         return events
+
+    def take_encoded(
+        self, *, ts: float, attn_dp_rank: Optional[int]
+    ) -> Optional[bytes]:
+        """Take all events as one encoded batch; None when there are none."""
+        return encode_kv_event_batch(self.take(), ts=ts, attn_dp_rank=attn_dp_rank)

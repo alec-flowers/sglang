@@ -23,7 +23,9 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    KVEventBatch,
     StorageMedium,
+    encode_kv_event_batch,
     kv_event_namespace_seed,
     namespaced_block_hash,
 )
@@ -32,6 +34,7 @@ from sglang.srt.managers.cache_controller import PrefetchAck
 from sglang.srt.managers.mm_utils import pad_mm_tokens
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache import events as mem_cache_events
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -45,7 +48,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.events import LoRANameTable
+from sglang.srt.mem_cache.events import LoRANameTable, MmRoutingLabels
 from sglang.srt.mem_cache.evict_policy import TLRUStrategy
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -2366,6 +2369,122 @@ def test_all_cleared_event_crosses_the_binding():
     core = _tree_core(enable_kv_cache_events=True)
     core._record_all_cleared_event()
     assert core.take_events() == [AllBlocksCleared()]
+
+
+def _evict_one_device_leaf(core):
+    tracker = {ComponentType.FULL: 0}
+    core.evict_device_start(ComponentType.FULL, 4)
+    candidate = core.evict_device_next_node(ComponentType.FULL, tracker).node_id
+    assert candidate is not None
+    evicted = core.evict_device_leaf(candidate, is_write_back=False)
+    evicted.device_frees.clear()
+    evicted.host_frees.clear()
+    core.evict_device_end(ComponentType.FULL)
+
+
+def _insert_key(core, **key_fields):
+    key = RadixKey(array("q", [1, 2, 7, 8, 9]), **key_fields)
+    _pump_insert(
+        core,
+        InsertParams(key=key, value=torch.tensor([10, 11, 12, 13], dtype=torch.int64)),
+    )
+
+
+def _text_events(core):
+    _insert(core, [1, 2, 7, 8], [10, 11, 12, 13])
+    # A second branch: its store links back to the shared first page.
+    _insert(core, [1, 2, 9, 10], [10, 11, 14, 15])
+    _evict_one_device_leaf(core)
+    core._record_all_cleared_event()
+
+
+def _named_lora_table():
+    lora_names = LoRANameTable()
+    lora_names.register(lora_id="a" * 32, lora_name="adapter-a")
+    return lora_names
+
+
+# name -> (tree core params, event script, whether the binding encodes it itself)
+_ENCODED_EVENT_CASES = {
+    "text": (dict(page_size=2), _text_events, True),
+    # A multimodal pad value: wider than 32 bits.
+    "wide_token": (
+        dict(page_size=1),
+        lambda core: _insert(core, [1_000_000 + 2**61], [10]),
+        True,
+    ),
+    "salted": (
+        dict(page_size=2),
+        lambda core: _insert_key(core, cache_salt="tenant-a"),
+        True,
+    ),
+    "dynamo_namespaced": (
+        dict(page_size=2, dynamo_kv_event_format=True),
+        lambda core: _insert_key(core, extra_key="user-1", cache_salt="tenant-a"),
+        True,
+    ),
+    "bigram": (
+        dict(page_size=2, is_eagle=True),
+        lambda core: _insert_key(core, is_bigram=True),
+        True,
+    ),
+    "host_tier": (
+        dict(page_size=1),
+        lambda core: _tlru_insert(core, [1, 2], [100, 101], "host"),
+        True,
+    ),
+    "named_lora": (
+        dict(page_size=2, kv_event_lora_names=_named_lora_table()),
+        lambda core: _insert_key(core, extra_key="user-" + "a" * 32),
+        False,
+    ),
+    "dynamo_named_lora": (
+        dict(
+            page_size=2,
+            dynamo_kv_event_format=True,
+            kv_event_lora_names=_named_lora_table(),
+        ),
+        lambda core: _insert_key(core, extra_key="user-" + "a" * 32),
+        False,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_ENCODED_EVENT_CASES))
+def test_encoded_events_are_the_msgspec_bytes_of_take_events(case):
+    """The Rust publisher sends what take_encoded_events returns, so it must be
+    byte for byte what the Python publisher sends for the same events."""
+    params, script, encodes_natively = _ENCODED_EVENT_CASES[case]
+    reference, encoded = (
+        _tree_core(enable_kv_cache_events=True, **params) for _ in range(2)
+    )
+    script(reference)
+    script(encoded)
+    assert encoded.kv_events.encodes_natively() == encodes_natively
+    payload = encoded.take_encoded_events(ts=1.5, attn_dp_rank=3)
+    assert payload is not None
+    assert payload == encode_kv_event_batch(
+        reference.take_events(), ts=1.5, attn_dp_rank=3
+    )
+    assert encoded.take_encoded_events(ts=1.5, attn_dp_rank=3) is None
+
+
+def test_encoded_events_carry_routing_spans_once_a_label_is_registered(monkeypatch):
+    """The binding has no routing labels, so it must stop encoding events
+    itself as soon as one exists, or labeled blocks lose their spans."""
+    monkeypatch.setattr(mem_cache_events, "MM_ROUTING_LABELS", MmRoutingLabels())
+    pad = 1_000_000 + 2**61
+    core = _tree_core(
+        enable_kv_cache_events=True, page_size=1, dynamo_kv_event_format=True
+    )
+    assert core.kv_events.encodes_natively()
+    mem_cache_events.MM_ROUTING_LABELS.register([pad], "label-a")
+    assert not core.kv_events.encodes_natively()
+    _insert(core, [pad], [10])
+    batch = msgspec.msgpack.decode(
+        core.take_encoded_events(ts=1.5, attn_dp_rank=0), type=KVEventBatch
+    )
+    assert batch.events[0].mm_routing_spans == [[(0, 1, "label-a")]]
 
 
 def test_match_result_mamba_fields_are_inert_without_mamba():

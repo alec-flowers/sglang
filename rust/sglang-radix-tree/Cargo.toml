@@ -12,6 +12,9 @@ python-module = "sglang.srt.mem_cache.rust_tree_core.mem_cache"
 debug = false
 features = ["python-extension"]
 torch-compat-header = "torch_compat.h"
+# The path dependency below sits outside this workspace, so name it for the
+# runtime build fingerprint.
+source-inputs = ["../sglang-kv-events"]
 
 [lib]
 name = "mem_cache"
@@ -24,6 +27,9 @@ crate-type = ["cdylib"]
 [dependencies]
 hashbrown = "0.16"
 pyo3 = { version = "0.29", optional = true }
+# The KV event wire codec only: no feature of it is enabled, so it adds no
+# transitive dependency to this extension.
+sglang-kv-events = { path = "../sglang-kv-events" }
 sha2 = "0.10"
 tch = "=0.24.0"
 thiserror = "1"

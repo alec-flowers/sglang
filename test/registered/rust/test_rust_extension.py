@@ -602,8 +602,10 @@ crate-type = ["cdylib"]
     def test_checked_in_crates_are_discovered_from_wheel_metadata(self):
         # No crate reads `proto/` at build time: the generated bindings are
         # checked in under rust/sglang-api-types and
-        # rust/sglang-runtime-v1-types (`cargo gen-api`), so the workspace is
-        # every extension's only source input.
+        # rust/sglang-runtime-v1-types (`cargo gen-api`), so a crate's own
+        # workspace is its only source input. sglang-radix-tree is the
+        # exception: its workspace is the crate, and it links the KV event
+        # codec from the main workspace.
         for python_module, package, library, features, source_inputs in (
             (
                 "sglang.srt.rust_extensions._server",
@@ -627,11 +629,18 @@ crate-type = ["cdylib"]
                 (),
             ),
             (
+                "sglang.srt.rust_extensions._kv_events",
+                "sglang-kv-events",
+                "sglang_kv_events",
+                ("python",),
+                (),
+            ),
+            (
                 "sglang.srt.mem_cache.rust_tree_core.mem_cache",
                 "sglang-radix-tree",
                 "mem_cache",
                 ("python-extension",),
-                (),
+                (rust_extension._RUST_WORKSPACE / "sglang-kv-events",),
             ),
         ):
             crate = rust_extension._discover_crate(

@@ -220,6 +220,12 @@ class UnifiedTreeCoreInterface(ABC):
         """Hand the queued KV placement events to the Controller."""
         return self.kv_events.take()
 
+    def take_encoded_events(
+        self, *, ts: float, attn_dp_rank: Optional[int]
+    ) -> Optional[bytes]:
+        """The queued KV placement events as one encoded batch, if any."""
+        return self.kv_events.take_encoded(ts=ts, attn_dp_rank=attn_dp_rank)
+
     @abstractmethod
     def reset(self) -> None:
         """Drop the entire tree and reinitialize empty state."""

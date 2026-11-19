@@ -4975,6 +4975,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Drain the KV event queue from the TreeCore.
         return self.tree_core.take_events()
 
+    def take_encoded_events(self, *, ts: float, attn_dp_rank: Optional[int]):
+        return self.tree_core.take_encoded_events(ts=ts, attn_dp_rank=attn_dp_rank)
+
     def resolve_node_handle(self, node_handle):
         """Look up the node object from its NodeId.
 

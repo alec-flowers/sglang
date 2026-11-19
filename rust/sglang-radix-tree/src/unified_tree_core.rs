@@ -7,6 +7,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
+use sglang_kv_events::wire;
 use sha2::{Digest, Sha256};
 use tch::{Device, Kind, Tensor};
 
@@ -6697,6 +6698,67 @@ pub enum KvCacheEvent<A> {
     },
     AllBlocksCleared,
 }
+
+/// Token atoms in the shape the wire codec publishes them.
+pub trait WireTokens: Sized {
+    fn into_token_ids(tokens: Vec<Self>) -> wire::TokenIds;
+}
+
+impl WireTokens for i64 {
+    fn into_token_ids(tokens: Vec<Self>) -> wire::TokenIds {
+        wire::TokenIds::Unigram(tokens)
+    }
+}
+
+impl WireTokens for (i64, i64) {
+    fn into_token_ids(tokens: Vec<Self>) -> wire::TokenIds {
+        wire::TokenIds::Bigram(tokens)
+    }
+}
+
+impl<A: WireTokens> KvCacheEvent<A> {
+    /// The published event. `extra_key` stays behind: it only selects the LoRA
+    /// namespace, which the Python recorder applies when adapters are named.
+    pub fn into_wire(self) -> wire::KvCacheEvent {
+        let wire_medium = |medium| match medium {
+            StorageMedium::Gpu => wire::StorageMedium::Gpu,
+            StorageMedium::Cpu => wire::StorageMedium::CpuPinned,
+        };
+        match self {
+            KvCacheEvent::BlockStored {
+                block_hashes,
+                parent_block_hash,
+                token_ids,
+                block_size,
+                medium,
+                cache_salt,
+                session_id,
+                extra_key: _,
+            } => wire::KvCacheEvent::BlockStored(wire::BlockStored {
+                block_hashes,
+                parent_block_hash,
+                token_ids: A::into_token_ids(token_ids),
+                block_size: u32::try_from(block_size).expect("page size fits u32"),
+                lora_id: None,
+                medium: Some(wire_medium(medium)),
+                cache_salt,
+                session_id,
+                lora_name: None,
+                mm_routing_spans: None,
+            }),
+            KvCacheEvent::BlockRemoved {
+                block_hashes,
+                medium,
+                extra_key: _,
+            } => wire::KvCacheEvent::BlockRemoved(wire::BlockRemoved {
+                block_hashes,
+                medium: Some(wire_medium(medium)),
+            }),
+            KvCacheEvent::AllBlocksCleared => wire::KvCacheEvent::AllBlocksCleared,
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "tests/unified_tree_core.rs"]
 mod tests;

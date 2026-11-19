@@ -13,11 +13,13 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import msgspec
 import zmq
 
+from sglang.srt.disaggregation import kv_events
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
@@ -32,6 +34,11 @@ from sglang.srt.disaggregation.kv_events import (
     resolve_load_pub_range,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler_components import (
+    kv_events_publisher as scheduler_publisher,
+)
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.runtime_context import describe_kv_events_publisher
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import get_free_port
@@ -131,6 +138,72 @@ class TestLocalKvEventSource(CustomTestCase):
                     break
             else:
                 self.fail("No event received from the advertised local source")
+
+
+class _RecorderOnlyCache:
+    """The event-draining surface of a prefix cache."""
+
+    def __init__(self):
+        self.kv_events = KVCacheEventRecorder(enabled=True, page_size=1)
+
+    take_events = BasePrefixCache.take_events
+    take_encoded_events = BasePrefixCache.take_encoded_events
+
+
+class TestSchedulerPublishing(CustomTestCase):
+    def _published_payload(self, *, rust):
+        with zmq.Context.instance().socket(zmq.PUB) as probe:
+            port = probe.bind_to_random_port("tcp://*")
+        parallel = SimpleNamespace(
+            pp_rank=0,
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            dp_rank=2,
+        )
+        cache = _RecorderOnlyCache()
+        with (
+            patch.object(kv_events, "get_parallel", return_value=parallel),
+            patch.object(scheduler_publisher, "get_parallel", return_value=parallel),
+            envs.SGLANG_USE_RUST_KV_EVENT_PUBLISHER.override(rust),
+        ):
+            component = scheduler_publisher.SchedulerKvEventsPublisher(
+                kv_events_config=json.dumps(
+                    {"publisher": "zmq", "endpoint": f"tcp://*:{port - 2}"}
+                ),
+                tree_cache=cache,
+                send_metrics_from_scheduler=None,
+                max_running_requests=1,
+                max_total_num_tokens=1,
+                get_stats=lambda: None,
+            )
+        atexit.unregister(component.kv_event_publisher.shutdown)
+        self.addCleanup(component.kv_event_publisher.shutdown)
+        self.assertEqual(component.publishes_encoded_batches, rust)
+        with (
+            zmq.Context() as context,
+            context.socket(zmq.SUB) as subscriber,
+            patch.object(scheduler_publisher.time, "time", return_value=1.5),
+        ):
+            subscriber.setsockopt_string(zmq.SUBSCRIBE, "")
+            subscriber.connect(f"tcp://127.0.0.1:{port}")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                cache.kv_events.record_all_cleared()
+                component.publish_kv_events()
+                if subscriber.poll(100):
+                    return subscriber.recv_multipart()[2]
+        self.fail("No batch reached the subscriber")
+
+    def test_both_backends_publish_the_same_payload(self):
+        # The Rust publisher is handed bytes the cache recorder encoded; they
+        # must be the batch the Python publisher would have encoded itself,
+        # rank included.
+        python_payload = self._published_payload(rust=False)
+        self.assertEqual(self._published_payload(rust=True), python_payload)
+        batch = msgspec.msgpack.decode(python_payload, type=KVEventBatch)
+        self.assertEqual(batch, KVEventBatch(1.5, [AllBlocksCleared()], 2))
 
 
 class TestOffsetEndpointPort(CustomTestCase):

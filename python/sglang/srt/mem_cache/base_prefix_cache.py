@@ -848,6 +848,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def take_events(self):
         return [] if self.kv_events is None else self.kv_events.take()
 
+    def take_encoded_events(
+        self, *, ts: float, attn_dp_rank: Optional[int]
+    ) -> Optional[bytes]:
+        """The queued KV events as one encoded batch; None when there are none."""
+        if self.kv_events is None:
+            return None
+        return self.kv_events.take_encoded(ts=ts, attn_dp_rank=attn_dp_rank)
+
     def supports_swa(self) -> bool:
         return False
 
